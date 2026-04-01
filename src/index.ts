@@ -490,6 +490,11 @@ async function handleMessage(data: {
 }) {
   const { message, sender } = data;
 
+  if (message.chat_type === "group") {
+    const mentioned = message.mentions && message.mentions.length > 0;
+    if (!mentioned) return;
+  }
+
   if (message.message_type !== "text") {
     await replyMessage(
       client,
