@@ -23,6 +23,7 @@ import {
   buildStatusCard,
   replyCard,
   updateCardMessage,
+  replyMarkdownCard,
 } from "./feishu-card.js";
 import { replyMessage, replyError, editMessage } from "./feishu-reply.js";
 import { loadUserStates, saveUserState, type PersistedState } from "./user-state.js";
@@ -330,7 +331,7 @@ class TextProgressUpdater {
       if (this.mode === "agent" && result.success && !result.isCloud) {
         output += "\n\n---\n继续发消息可在同一会话中追加需求，或发 /new 开始新任务。";
       }
-      await replyMessage(client, this.originMessageId, output);
+      await replyMarkdownCard(client, this.originMessageId, output);
     }
   }
 }

@@ -1,6 +1,7 @@
 import type { Client, InteractiveCard } from "@larksuiteoapi/node-sdk";
 import { config } from "./config.js";
 import { getModeLabel, type CursorMode } from "./command-parser.js";
+import { replyMessage } from "./feishu-reply.js";
 
 interface StatusCardOptions {
   mode: CursorMode;
@@ -199,4 +200,58 @@ export function buildStatusCard(options: StatusCardOptions): InteractiveCard {
       },
     ],
   };
+}
+
+// ── Markdown 卡片 ────────────────────────────────────────
+
+const MAX_CARD_CONTENT = 8000;
+
+function buildMarkdownCard(content: string): InteractiveCard {
+  return {
+    config: { wide_screen_mode: true },
+    elements: [{ tag: "markdown", content }],
+  };
+}
+
+function splitMarkdown(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const parts: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      parts.push(remaining);
+      break;
+    }
+
+    let splitAt = remaining.lastIndexOf("\n\n", maxLen);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt <= 0) splitAt = maxLen;
+
+    parts.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+
+  return parts;
+}
+
+/** 以 Markdown 卡片回复消息。失败时自动回退为纯文本。返回第一条回复的 message_id。 */
+export async function replyMarkdownCard(
+  client: Client,
+  messageId: string,
+  markdown: string,
+): Promise<string | undefined> {
+  try {
+    const parts = splitMarkdown(markdown, MAX_CARD_CONTENT);
+    let firstId: string | undefined;
+    for (const part of parts) {
+      const id = await replyCard(client, messageId, buildMarkdownCard(part));
+      if (!firstId) firstId = id;
+    }
+    return firstId;
+  } catch (err) {
+    console.warn("[card] Markdown 卡片发送失败，回退纯文本:", err);
+    return replyMessage(client, messageId, markdown);
+  }
 }

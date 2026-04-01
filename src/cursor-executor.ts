@@ -84,7 +84,10 @@ function buildArgs(opts: ExecuteOptions, stream: boolean): string[] {
     return ["-c", opts.prompt];
   }
 
-  const args: string[] = ["-p", "--force"];
+  const args: string[] = ["-p"];
+  if (opts.mode === "agent") {
+    args.push("--force");
+  }
 
   if (opts.chatId) {
     args.push(`--resume=${opts.chatId}`);
