@@ -6,6 +6,11 @@ export interface ParsedCommand {
   prompt: string;
 }
 
+export interface InputCommand {
+  type: "input";
+  text: string;
+}
+
 export interface ModelCommand {
   type: "model";
   model: string;
@@ -36,20 +41,27 @@ export interface WsSwitchCommand {
   alias: string;
 }
 
+export interface ReloadCommand {
+  type: "reload";
+}
+
 export type Command =
   | ParsedCommand
+  | InputCommand
   | ModelCommand
   | HelpCommand
   | StatusCommand
   | NewSessionCommand
   | WsCommand
   | CancelCommand
-  | WsSwitchCommand;
+  | WsSwitchCommand
+  | ReloadCommand;
 
 const SLASH_COMMANDS: Record<string, CursorMode> = {
+  "/plan": "plan",
   "/ask": "ask",
+  "/agent": "agent",
   "/cloud": "cloud",
-  "/run": "agent",
 };
 
 /**
@@ -98,6 +110,10 @@ export function parseCommand(text: string): Command {
     return { type: "cancel" };
   }
 
+  if (trimmed === "/reload") {
+    return { type: "reload" };
+  }
+
   for (const [prefix, mode] of Object.entries(SLASH_COMMANDS)) {
     if (trimmed.startsWith(prefix + " ")) {
       return {
@@ -115,11 +131,7 @@ export function parseCommand(text: string): Command {
     }
   }
 
-  return {
-    type: "cursor",
-    mode: "plan",
-    prompt: trimmed,
-  };
+  return { type: "input", text: trimmed };
 }
 
 export function getModeLabel(mode: CursorMode): string {
@@ -135,28 +147,30 @@ export function getModeLabel(mode: CursorMode): string {
   }
 }
 
-export const HELP_TEXT = `使用方式：
+export const HELP_TEXT = `**使用方式**
 
-• 直接发送文本 → 自动进入 plan 模式，Cursor 会分析代码并生成方案
-• 继续发送文本 → 在同一会话中细化方案
-• /run [指示] → 开始执行并允许改文件；不带参数则执行之前的方案
-• /ask [问题] → 只读问答，不改任何文件
-• /cloud [任务] → 提交到 Cloud Agent
+- 直接发送文本 → 暂存需求描述，可多次补充
+- \`/plan\` [指示] → 开始规划（合并已暂存的内容）
+- \`/agent\` [指示] → 开始执行并允许改文件
+- \`/ask\` [问题] → 只读问答，不改任何文件
+- \`/cloud\` [任务] → 提交到 Cloud Agent
 
-上下文管理：
+**上下文管理**
 
-• /new → 清除当前会话，重新开始
-• /cancel → 取消正在执行的任务
-• /status → 查看当前会话状态
-• /model <名称> → 切换模型
+- \`/new\` → 清除当前会话，重新开始
+- \`/cancel\` → 取消任务或清空暂存消息
+- \`/status\` → 查看当前会话状态
+- \`/model\` <名称> → 切换模型
 
-工作区管理：
+**工作区管理**
 
-• /ws → 查看可用工作区
-• /ws <别名> → 切换到预设工作区
+- \`/ws\` → 查看可用工作区
+- \`/ws\` <别名或编号> → 切换到预设工作区
+- \`/reload\` → 重新加载工作区配置
 
-推荐流程：
+**推荐流程**
 
 1. 发送任务描述，如"给登录页加验证码并补测试"
-2. 查看 Cursor 的方案，继续发消息细化
-3. 方案满意后发 /run 开始执行`;
+2. 继续发消息补充细节
+3. 发 \`/plan\` 查看 Cursor 的方案
+4. 方案满意后发 \`/agent\` 开始执行`;

@@ -4,7 +4,7 @@ import {
   EventDispatcher,
   WSClient,
 } from "@larksuiteoapi/node-sdk";
-import { config, workspaces } from "./config.js";
+import { config, workspaces, reloadWorkspaces } from "./config.js";
 import {
   extractTextFromContent,
   getModeLabel,
@@ -21,11 +21,13 @@ import {
 } from "./cursor-executor.js";
 import {
   buildStatusCard,
+  buildInfoCard,
+  buildSessionCard,
   replyCard,
-  updateCardMessage,
   replyMarkdownCard,
+  type StatusCardOptions,
 } from "./feishu-card.js";
-import { replyMessage, replyError, editMessage } from "./feishu-reply.js";
+import { replyMessage, replyError, editCard } from "./feishu-reply.js";
 import { loadUserStates, saveUserState, type PersistedState } from "./user-state.js";
 
 const client = new Client({
@@ -57,6 +59,7 @@ interface TaskRecord {
 interface QueuedMessage {
   text: string;
   messageId: string;
+  mode?: CursorMode;
 }
 
 interface UserSession {
@@ -65,6 +68,7 @@ interface UserSession {
   chatId?: string;
   activeTask?: TaskRecord;
   messageQueue: QueuedMessage[];
+  inputBuffer: QueuedMessage[];
 }
 
 const sessions = new Map<string, UserSession>();
@@ -84,6 +88,7 @@ function getSession(userId: string): UserSession {
       model: persisted?.model ?? config.cursor.defaultModel,
       chatId: persisted?.chatId,
       messageQueue: [],
+      inputBuffer: [],
     };
     sessions.set(userId, session);
   }
@@ -98,6 +103,18 @@ function persistSession(userId: string, session: UserSession): void {
   };
   saveUserState(userId, state);
 }
+
+// ── 输入缓冲 ─────────────────────────────────────────────
+
+function clearBuffer(session: UserSession): QueuedMessage[] {
+  return session.inputBuffer.splice(0);
+}
+
+function mergeBufferText(buffer: QueuedMessage[]): string {
+  return buffer.map((m) => m.text).join("\n");
+}
+
+// ── 工具函数 ──────────────────────────────────────────────
 
 function findWorkspaceAlias(dir: string): string | undefined {
   for (const [alias, workspaceDir] of workspaces) {
@@ -136,49 +153,6 @@ function formatDurationMs(durationMs?: number): string | undefined {
   return `${minutes}m${rest}s`;
 }
 
-function renderStatus(session: UserSession): string {
-  const lines = [
-    "当前状态",
-    "",
-    `工作区: ${getWorkspaceLabel(session.workDir)}`,
-    `模型: ${session.model ?? "Cursor 默认"}`,
-    `会话: ${session.chatId ? `已连接 (${session.chatId.slice(0, 8)})` : "未建立"}`,
-  ];
-
-  if (session.activeTask) {
-    lines.push(
-      `运行中: ${getModeLabel(session.activeTask.mode)} · ${summarizePrompt(session.activeTask.prompt)} · 已运行 ${formatElapsed(session.activeTask.startedAt)}`
-    );
-  } else {
-    lines.push("运行中: 无");
-  }
-
-  if (session.messageQueue.length > 0) {
-    lines.push(`排队消息: ${session.messageQueue.length} 条`);
-  }
-
-  lines.push("");
-  lines.push("推荐流程: 发送任务 → 查看方案 → /run 执行");
-  return lines.join("\n");
-}
-
-function renderWorkspaceList(session: UserSession): string {
-  if (workspaces.size === 0) {
-    return "尚未定义任何工作区。\n请在 workspaces.json 中配置别名后重启服务。";
-  }
-
-  const lines = ["可用工作区", ""];
-  let idx = 1;
-  for (const [alias, dir] of workspaces) {
-    const suffix = session.workDir === dir ? " (当前)" : "";
-    lines.push(`${idx}. ${alias}${suffix}`);
-    idx++;
-  }
-  lines.push("");
-  lines.push("发送 /ws <编号或别名> 即可切换。");
-  return lines.join("\n");
-}
-
 function renderSummary(counts: { read: number; write: number; command: number; search: number; other: number }): string {
   const parts: string[] = [];
   if (counts.read) parts.push(`读取 ${counts.read}`);
@@ -189,17 +163,34 @@ function renderSummary(counts: { read: number; write: number; command: number; s
   return parts.join(" · ");
 }
 
+function renderWorkspaceList(session: UserSession): string {
+  if (workspaces.size === 0) {
+    return "尚未定义任何工作区。\n请在 `workspaces.json` 中配置别名后发 `/reload`。";
+  }
+
+  const lines: string[] = [];
+  let idx = 1;
+  for (const [alias, dir] of workspaces) {
+    const isCurrent = session.workDir === dir;
+    lines.push(isCurrent ? `${idx}. **${alias}** (当前)` : `${idx}. ${alias}`);
+    idx++;
+  }
+  lines.push("", "发送 `/ws` <编号或别名> 即可切换。");
+  return lines.join("\n");
+}
+
 function isSessionMutable(command: Command): boolean {
   return command.type === "new"
     || command.type === "ws-switch"
     || command.type === "model";
 }
 
-// ── 实时状态面板 ─────────────────────────────────────────
+// ── 实时状态面板 (卡片模式) ──────────────────────────────
 const THROTTLE_MS = 15_000;
 const MAX_EDITS_PER_MSG = 18;
 
-class TextProgressUpdater {
+class CardProgressUpdater {
+  private client: Client;
   private originMessageId: string;
   private currentMessageId: string;
   private workDir: string;
@@ -208,7 +199,7 @@ class TextProgressUpdater {
   private sessionLabel: string;
   private model?: string;
   private startTime = Date.now();
-  private currentActivity = "准备中";
+  private currentActivity = "正在启动";
   private counts = { read: 0, write: 0, command: 0, search: 0, other: 0 };
 
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -217,10 +208,12 @@ class TextProgressUpdater {
   private editCount = 0;
 
   constructor(
+    feishuClient: Client,
     originMessageId: string,
     progressMessageId: string,
-    options: { workDir: string; mode: CursorMode; prompt: string; sessionLabel: string; model?: string }
+    options: { workDir: string; mode: CursorMode; prompt: string; sessionLabel: string; model?: string },
   ) {
+    this.client = feishuClient;
     this.originMessageId = originMessageId;
     this.currentMessageId = progressMessageId;
     this.workDir = options.workDir;
@@ -245,6 +238,24 @@ class TextProgressUpdater {
     this.scheduleFlush();
   }
 
+  private buildCard(
+    status: StatusCardOptions["status"],
+    note?: string,
+  ) {
+    return buildStatusCard({
+      mode: this.mode,
+      prompt: this.prompt,
+      workspaceLabel: getWorkspaceLabel(this.workDir),
+      model: this.model,
+      sessionLabel: this.sessionLabel,
+      status,
+      currentActivity: this.currentActivity,
+      elapsedText: formatElapsed(this.startTime),
+      summary: renderSummary(this.counts) || undefined,
+      note,
+    });
+  }
+
   private scheduleFlush() {
     if (this.timer) return;
 
@@ -259,7 +270,7 @@ class TextProgressUpdater {
 
   private async flush() {
     if (this.editCount >= MAX_EDITS_PER_MSG) {
-      const newId = await replyMessage(client, this.originMessageId, this.renderRunning());
+      const newId = await replyCard(this.client, this.originMessageId, this.buildCard("running"));
       if (newId) {
         this.currentMessageId = newId;
         this.editCount = 0;
@@ -268,28 +279,7 @@ class TextProgressUpdater {
     }
     this.editCount++;
     this.lastEditTime = Date.now();
-    await editMessage(client, this.currentMessageId, this.renderRunning()).catch(console.error);
-  }
-
-  private renderRunning(): string {
-    const lines = [
-      "任务执行中",
-      "",
-      `模式: ${getModeLabel(this.mode)}`,
-      `工作区: ${getWorkspaceLabel(this.workDir)}`,
-      `会话: ${this.sessionLabel}`,
-      `模型: ${this.model ?? "Cursor 默认"}`,
-      `任务: ${summarizePrompt(this.prompt, 120)}`,
-      "",
-      `状态: ${this.currentActivity}`,
-      `用时: ${formatElapsed(this.startTime)}`,
-    ];
-
-    const summary = renderSummary(this.counts);
-    if (summary) {
-      lines.push(`轨迹: ${summary}`);
-    }
-    return lines.join("\n");
+    await editCard(this.client, this.currentMessageId, this.buildCard("running")).catch(console.error);
   }
 
   async finalize(result: ExecuteResult) {
@@ -303,35 +293,24 @@ class TextProgressUpdater {
     }
 
     const dur = formatDurationMs(result.durationMs) ?? formatElapsed(this.startTime);
-    const summary = renderSummary(this.counts);
-    const status = result.cancelled
-      ? `任务已取消 (耗时 ${dur})`
+
+    const cardStatus: StatusCardOptions["status"] = result.cancelled
+      ? "cancelled"
       : result.success
-        ? result.isCloud ? `任务已提交 (耗时 ${dur})` : `任务已完成 (耗时 ${dur})`
-        : `任务失败 (耗时 ${dur})`;
+        ? result.isCloud ? "submitted" : "success"
+        : "error";
 
-    const lines = [
-      status,
-      "",
-      `模式: ${getModeLabel(this.mode)}`,
-      `工作区: ${getWorkspaceLabel(this.workDir)}`,
-      `会话: ${this.sessionLabel}`,
-      `模型: ${this.model ?? "Cursor 默认"}`,
-      `任务: ${summarizePrompt(this.prompt, 120)}`,
-    ];
+    this.currentActivity = `耗时 ${dur}`;
 
-    if (summary) {
-      lines.push(`轨迹: ${summary}`);
+    let note: string | undefined;
+    if (this.mode === "agent" && result.success && !result.isCloud && !result.cancelled) {
+      note = "继续发消息可在同一会话中追加需求，或发 `/new` 开始新任务。";
     }
 
-    await editMessage(client, this.currentMessageId, lines.join("\n")).catch(console.error);
+    await editCard(this.client, this.currentMessageId, this.buildCard(cardStatus, note)).catch(console.error);
 
     if (result.output && !result.cancelled) {
-      let output = result.output;
-      if (this.mode === "agent" && result.success && !result.isCloud) {
-        output += "\n\n---\n继续发消息可在同一会话中追加需求，或发 /new 开始新任务。";
-      }
-      await replyMarkdownCard(client, this.originMessageId, output);
+      await replyMarkdownCard(this.client, this.originMessageId, result.output);
     }
   }
 }
@@ -359,7 +338,7 @@ async function executeCursorCommand(
   userId: string,
   session: UserSession,
   mode: CursorMode,
-  prompt: string
+  prompt: string,
 ): Promise<ExecuteResult> {
   const abortController = new AbortController();
   if (session.activeTask) {
@@ -376,19 +355,18 @@ async function executeCursorCommand(
   }
 
   const sessionLabel = chatId ? `已连接 (${chatId.slice(0, 8)})` : "独立执行";
-  const intro = [
-    "任务已接收",
-    "",
-    `模式: ${getModeLabel(mode)}`,
-    `工作区: ${getWorkspaceLabel(session.workDir)}`,
-    `会话: ${sessionLabel}`,
-    `模型: ${session.model ?? "Cursor 默认"}`,
-    `任务: ${summarizePrompt(prompt, 120)}`,
-    "",
-    mode === "cloud" ? "状态: 正在提交到 Cloud Agent" : "状态: 正在启动",
-  ].join("\n");
 
-  const progressMsgId = await replyMessage(client, messageId, intro);
+  const initialCard = buildStatusCard({
+    mode,
+    prompt,
+    workspaceLabel: getWorkspaceLabel(session.workDir),
+    model: session.model,
+    sessionLabel,
+    status: "running",
+    currentActivity: mode === "cloud" ? "正在提交到 Cloud Agent" : "正在启动",
+  });
+
+  const progressMsgId = await replyCard(client, messageId, initialCard);
   if (!progressMsgId) {
     const failed: ExecuteResult = {
       success: false,
@@ -399,7 +377,7 @@ async function executeCursorCommand(
     return failed;
   }
 
-  const updater = new TextProgressUpdater(messageId, progressMsgId, {
+  const updater = new CardProgressUpdater(client, messageId, progressMsgId, {
     workDir: session.workDir,
     mode,
     prompt,
@@ -465,19 +443,21 @@ async function executeCursorCommand(
 async function drainMessageQueue(
   userId: string,
   session: UserSession,
-  lastMessageId: string
+  lastMessageId: string,
 ): Promise<void> {
   if (session.messageQueue.length === 0) return;
 
   const queued = session.messageQueue.splice(0);
   const mergedPrompt = queued.map((m) => m.text).join("\n");
   const replyTo = queued[queued.length - 1].messageId;
+  const explicitMode = [...queued].reverse().find((m) => m.mode)?.mode;
+  const mode = explicitMode ?? (config.cursor.defaultMode as CursorMode);
 
-  console.log(`[queue] 合并 ${queued.length} 条排队消息，以 plan 模式继续`);
+  console.log(`[queue] 合并 ${queued.length} 条排队消息，以 ${mode} 模式继续${explicitMode ? " (用户指定)" : ""}`);
   await replyMessage(client, replyTo, `前序任务已完成，正在处理你排队的 ${queued.length} 条消息...`);
 
   const task: TaskRecord = {
-    mode: "plan",
+    mode,
     prompt: mergedPrompt,
     startedAt: Date.now(),
     originMessageId: replyTo,
@@ -486,7 +466,7 @@ async function drainMessageQueue(
 
   session.activeTask = task;
   try {
-    await executeCursorCommand(replyTo, userId, session, "plan", mergedPrompt);
+    await executeCursorCommand(replyTo, userId, session, mode, mergedPrompt);
   } catch (err) {
     console.error("[queue] 队列消息执行失败:", err);
   } finally {
@@ -514,7 +494,7 @@ async function handleMessage(data: {
     await replyMessage(
       client,
       message.message_id,
-      "暂时只支持文本消息，请发送文字指令。"
+      "暂时只支持文本消息，请发送文字指令。",
     );
     return;
   }
@@ -530,12 +510,14 @@ async function handleMessage(data: {
   console.log(`[msg] ${userId.slice(0, 10)}... | ${cmdLabel} | ${text.slice(0, 80)}`);
 
   if (session.activeTask) {
-    if (command.type === "cursor") {
-      session.messageQueue.push({ text: command.prompt, messageId: message.message_id });
+    if (command.type === "cursor" || command.type === "input") {
+      const queueText = command.type === "cursor" ? command.prompt : command.text;
+      const queueMode = command.type === "cursor" ? command.mode : undefined;
+      session.messageQueue.push({ text: queueText, messageId: message.message_id, mode: queueMode });
       await replyMessage(
         client,
         message.message_id,
-        `当前正在执行 ${getModeLabel(session.activeTask.mode)} 任务，你的消息已记录（队列中 ${session.messageQueue.length} 条），完成后会自动继续。`
+        `当前正在执行 ${getModeLabel(session.activeTask.mode)} 任务，你的消息已记录（队列中 ${session.messageQueue.length} 条），完成后会自动继续。`,
       );
       return;
     }
@@ -543,7 +525,7 @@ async function handleMessage(data: {
       await replyMessage(
         client,
         message.message_id,
-        `当前有任务执行中，请等待完成后再操作，或先发送 /cancel 取消。`
+        `当前有任务执行中，请等待完成后再操作，或先发送 /cancel 取消。`,
       );
       return;
     }
@@ -551,40 +533,57 @@ async function handleMessage(data: {
 
   switch (command.type) {
     case "help": {
-      await replyMessage(client, message.message_id, HELP_TEXT);
+      await replyCard(client, message.message_id, buildInfoCard("使用帮助", HELP_TEXT));
       break;
     }
 
     case "status": {
-      await replyMessage(client, message.message_id, renderStatus(session));
+      const sessionLabel = session.chatId ? `已连接 (${session.chatId.slice(0, 8)})` : "未建立";
+      let activeTaskInfo: string | undefined;
+      if (session.activeTask) {
+        activeTaskInfo = `${getModeLabel(session.activeTask.mode)} · ${summarizePrompt(session.activeTask.prompt)} · 已运行 ${formatElapsed(session.activeTask.startedAt)}`;
+      }
+      await replyCard(client, message.message_id, buildSessionCard({
+        workspaceLabel: getWorkspaceLabel(session.workDir),
+        model: session.model,
+        sessionLabel,
+        activeTaskInfo,
+        bufferCount: session.inputBuffer.length,
+        queueCount: session.messageQueue.length,
+      }));
       break;
     }
 
     case "cancel": {
-      if (!session.activeTask) {
-        await replyMessage(client, message.message_id, "当前没有正在执行的任务。");
-        break;
+      if (session.activeTask) {
+        session.activeTask.abortController?.abort();
+        session.messageQueue = [];
+        await replyMessage(client, message.message_id, "已取消当前任务，排队消息已清空。");
+      } else if (session.inputBuffer.length > 0) {
+        const count = session.inputBuffer.length;
+        clearBuffer(session);
+        await replyMessage(client, message.message_id, `已清空 ${count} 条暂存消息。`);
+      } else {
+        await replyMessage(client, message.message_id, "当前没有正在执行的任务，也没有暂存消息。");
       }
-      session.activeTask.abortController?.abort();
-      session.messageQueue = [];
-      await replyMessage(client, message.message_id, "已取消当前任务，排队消息已清空。");
       break;
     }
 
     case "new": {
+      clearBuffer(session);
       session.chatId = undefined;
       session.messageQueue = [];
       persistSession(userId, session);
       await replyMessage(
         client,
         message.message_id,
-        `已清除会话。\n工作区: ${getWorkspaceLabel(session.workDir)}\n下一条消息会开启新会话。`
+        `已清除会话。\n工作区: ${getWorkspaceLabel(session.workDir)}\n下一条消息会开启新会话。`,
       );
       break;
     }
 
     case "ws": {
-      await replyMessage(client, message.message_id, renderWorkspaceList(session));
+      await replyCard(client, message.message_id, buildInfoCard("可用工作区", renderWorkspaceList(session)));
       break;
     }
 
@@ -616,6 +615,7 @@ async function handleMessage(data: {
         await replyMessage(client, message.message_id, `工作区 '${targetAlias}' 指向的目录不存在或不可用：${targetDir}`);
         break;
       }
+      clearBuffer(session);
       session.workDir = targetDir;
       session.chatId = undefined;
       session.messageQueue = [];
@@ -623,7 +623,7 @@ async function handleMessage(data: {
       await replyMessage(
         client,
         message.message_id,
-        `已切换到工作区 ${targetAlias}\n会话已重置，下一条消息会开启新会话。`
+        `已切换到工作区 ${targetAlias}\n会话已重置，下一条消息会开启新会话。`,
       );
       break;
     }
@@ -634,20 +634,44 @@ async function handleMessage(data: {
       await replyMessage(
         client,
         message.message_id,
-        `默认模型已切换为: ${command.model}`
+        `默认模型已切换为: ${command.model}`,
       );
       break;
     }
 
+    case "reload": {
+      const count = reloadWorkspaces();
+      await replyMessage(client, message.message_id, `已重新加载 ${count} 个工作区。`);
+      break;
+    }
+
+    case "input": {
+      session.inputBuffer.push({ text: command.text, messageId: message.message_id });
+
+      const count = session.inputBuffer.length;
+      if (count === 1) {
+        await replyMessage(
+          client,
+          message.message_id,
+          `已记录。继续发送补充，或发 /plan 开始规划。`,
+        );
+      } else {
+        await replyMessage(client, message.message_id, `已记录 (共 ${count} 条)`);
+      }
+      break;
+    }
+
     case "cursor": {
-      let prompt = command.prompt;
+      const buffer = clearBuffer(session);
+      const bufferText = mergeBufferText(buffer);
+      let prompt = [bufferText, command.prompt].filter(Boolean).join("\n");
 
       if (command.mode === "agent" && !prompt) {
         if (!session.chatId) {
           await replyMessage(
             client,
             message.message_id,
-            "请先发送任务描述，我会帮你规划方案，满意后再 /run 执行。"
+            "请先发送任务描述，我会帮你规划方案，满意后再 /agent 执行。",
           );
           break;
         }
@@ -658,7 +682,7 @@ async function handleMessage(data: {
         await replyMessage(
           client,
           message.message_id,
-          "请提供任务描述或问题。"
+          "请提供任务描述或问题。",
         );
         break;
       }

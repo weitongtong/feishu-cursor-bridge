@@ -1,29 +1,8 @@
 import type { Client, InteractiveCard } from "@larksuiteoapi/node-sdk";
-import { config } from "./config.js";
 import { getModeLabel, type CursorMode } from "./command-parser.js";
 import { replyMessage } from "./feishu-reply.js";
 
-interface StatusCardOptions {
-  mode: CursorMode;
-  prompt: string;
-  workspaceLabel: string;
-  model?: string;
-  requesterName?: string;
-  status: "queued" | "running" | "submitted" | "success" | "error";
-  currentActivity?: string;
-  elapsedText?: string;
-  summary?: string;
-  note?: string;
-}
-
-const FEISHU_OPEN_API = "https://open.feishu.cn";
-
-let tenantTokenCache:
-  | {
-      token: string;
-      expiresAt: number;
-    }
-  | undefined;
+// ── Helpers ──────────────────────────────────────────────
 
 function plainText(content: string, lines = 2) {
   return { tag: "plain_text" as const, content, lines };
@@ -35,7 +14,24 @@ function summarizePrompt(prompt: string, maxLen = 160): string {
   return singleLine.slice(0, maxLen - 1) + "…";
 }
 
-function getStatusMeta(status: StatusCardOptions["status"]) {
+// ── Status Card ──────────────────────────────────────────
+
+type CardStatus = "queued" | "running" | "submitted" | "success" | "error" | "cancelled";
+
+export interface StatusCardOptions {
+  mode: CursorMode;
+  prompt: string;
+  workspaceLabel: string;
+  model?: string;
+  sessionLabel?: string;
+  status: CardStatus;
+  currentActivity?: string;
+  elapsedText?: string;
+  summary?: string;
+  note?: string;
+}
+
+function getStatusMeta(status: CardStatus) {
   switch (status) {
     case "queued":
       return { title: "任务排队中", template: "blue" as const };
@@ -47,162 +43,118 @@ function getStatusMeta(status: StatusCardOptions["status"]) {
       return { title: "任务已完成", template: "green" as const };
     case "error":
       return { title: "任务失败", template: "red" as const };
+    case "cancelled":
+      return { title: "任务已取消", template: "orange" as const };
   }
-}
-
-async function getTenantAccessToken(): Promise<string> {
-  if (tenantTokenCache && tenantTokenCache.expiresAt > Date.now()) {
-    return tenantTokenCache.token;
-  }
-
-  const resp = await fetch(`${FEISHU_OPEN_API}/open-apis/auth/v3/tenant_access_token/internal`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      app_id: config.feishu.appId,
-      app_secret: config.feishu.appSecret,
-    }),
-  });
-
-  if (!resp.ok) {
-    throw new Error(`获取 tenant_access_token 失败: HTTP ${resp.status}`);
-  }
-
-  const json = await resp.json() as {
-    code?: number;
-    msg?: string;
-    tenant_access_token?: string;
-    expire?: number;
-  };
-
-  if (json.code !== 0 || !json.tenant_access_token) {
-    throw new Error(`获取 tenant_access_token 失败: ${json.msg ?? "unknown error"}`);
-  }
-
-  const expiresInSec = json.expire ?? 7200;
-  tenantTokenCache = {
-    token: json.tenant_access_token,
-    expiresAt: Date.now() + Math.max(60, expiresInSec - 120) * 1000,
-  };
-  return tenantTokenCache.token;
-}
-
-async function feishuOpenApi<T>(path: string, init: RequestInit): Promise<T> {
-  const token = await getTenantAccessToken();
-  const resp = await fetch(`${FEISHU_OPEN_API}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
-
-  const json = await resp.json() as {
-    code?: number;
-    msg?: string;
-    data?: T;
-  };
-
-  if (!resp.ok || json.code !== 0) {
-    throw new Error(`飞书接口调用失败: ${json.msg ?? `HTTP ${resp.status}`}`);
-  }
-
-  return (json.data ?? {}) as T;
-}
-
-export async function sendEphemeralCard(
-  chatId: string,
-  openId: string,
-  card: InteractiveCard
-): Promise<string | undefined> {
-  const data = await feishuOpenApi<{ message_id?: string }>("/open-apis/ephemeral/v1/send", {
-    method: "POST",
-    body: JSON.stringify({
-      chat_id: chatId,
-      open_id: openId,
-      msg_type: "interactive",
-      card,
-    }),
-  });
-  return data.message_id;
-}
-
-export async function updateCardMessage(messageId: string, card: InteractiveCard): Promise<void> {
-  await feishuOpenApi(`/open-apis/im/v1/messages/${messageId}`, {
-    method: "PATCH",
-    body: JSON.stringify({
-      content: JSON.stringify(card),
-    }),
-  });
-}
-
-export async function replyCard(
-  client: Client,
-  messageId: string,
-  card: InteractiveCard
-): Promise<string | undefined> {
-  const resp = await client.im.message.reply({
-    path: { message_id: messageId },
-    data: {
-      content: JSON.stringify(card),
-      msg_type: "interactive",
-    },
-  });
-  return resp.data?.message_id;
 }
 
 export function buildStatusCard(options: StatusCardOptions): InteractiveCard {
   const meta = getStatusMeta(options.status);
+
+  const fields: Array<{ is_short: boolean; text: ReturnType<typeof plainText> }> = [
+    { is_short: true, text: plainText(`模式: ${getModeLabel(options.mode)}`) },
+    { is_short: true, text: plainText(`工作区: ${options.workspaceLabel}`) },
+    { is_short: true, text: plainText(`模型: ${options.model ?? "Cursor 默认"}`) },
+  ];
+
+  if (options.sessionLabel) {
+    fields.push({ is_short: true, text: plainText(`会话: ${options.sessionLabel}`) });
+  }
+
+  fields.push({
+    is_short: true,
+    text: plainText(`状态: ${options.currentActivity ?? meta.title}`),
+  });
+
+  const elements: unknown[] = [
+    {
+      tag: "div",
+      text: plainText(summarizePrompt(options.prompt, 220), 4),
+      fields,
+    },
+  ];
+
+  const mdParts = [
+    options.elapsedText ? `用时: ${options.elapsedText}` : "",
+    options.summary ? `轨迹: ${options.summary}` : "",
+    options.note ?? "",
+  ].filter(Boolean);
+
+  if (mdParts.length > 0) {
+    elements.push({ tag: "markdown", content: mdParts.join("\n") });
+  }
+
   return {
-    config: {
-      wide_screen_mode: true,
-      enable_forward: false,
-      update_multi: true,
-    },
-    header: {
-      template: meta.template,
-      title: plainText(meta.title, 1),
-    },
-    elements: [
-      {
-        tag: "div",
-        text: plainText(summarizePrompt(options.prompt, 220), 4),
-        fields: [
-          {
-            is_short: true,
-            text: plainText(`模式: ${getModeLabel(options.mode)}`, 2),
-          },
-          {
-            is_short: true,
-            text: plainText(`工作区: ${options.workspaceLabel}`, 2),
-          },
-          {
-            is_short: true,
-            text: plainText(`模型: ${options.model ?? "Cursor 默认"}`, 2),
-          },
-          {
-            is_short: true,
-            text: plainText(`状态: ${options.currentActivity ?? meta.title}`, 2),
-          },
-        ],
-      },
-      {
-        tag: "markdown",
-        content: [
-          options.requesterName ? `发起人: ${options.requesterName}` : "",
-          options.elapsedText ? `用时: ${options.elapsedText}` : "",
-          options.summary ? `轨迹: ${options.summary}` : "",
-          options.note ?? "",
-        ].filter(Boolean).join("\n"),
-      },
-    ],
+    config: { wide_screen_mode: true, enable_forward: false, update_multi: true },
+    header: { template: meta.template, title: plainText(meta.title, 1) },
+    elements: elements as InteractiveCard["elements"],
   };
 }
 
-// ── Markdown 卡片 ────────────────────────────────────────
+// ── Info Card (带标题的 Markdown 卡片) ───────────────────
+
+export function buildInfoCard(
+  title: string,
+  markdown: string,
+  template = "blue",
+): InteractiveCard {
+  return {
+    config: { wide_screen_mode: true },
+    header: { template: template as never, title: plainText(title, 1) },
+    elements: [{ tag: "markdown", content: markdown }],
+  };
+}
+
+// ── Session Card (/status) ──────────────────────────────
+
+export interface SessionCardOptions {
+  workspaceLabel: string;
+  model?: string;
+  sessionLabel: string;
+  activeTaskInfo?: string;
+  bufferCount?: number;
+  queueCount?: number;
+}
+
+export function buildSessionCard(options: SessionCardOptions): InteractiveCard {
+  const mdLines: string[] = [
+    `**工作区**: ${options.workspaceLabel}`,
+    `**模型**: ${options.model ?? "Cursor 默认"}`,
+    `**会话**: ${options.sessionLabel}`,
+    `**运行中**: ${options.activeTaskInfo ?? "无"}`,
+  ];
+
+  if (options.bufferCount && options.bufferCount > 0) {
+    mdLines.push(`**暂存消息**: ${options.bufferCount} 条`);
+  }
+  if (options.queueCount && options.queueCount > 0) {
+    mdLines.push(`**排队消息**: ${options.queueCount} 条`);
+  }
+
+  mdLines.push("", "**推荐流程**: 发送任务 → `/plan` 规划 → `/agent` 执行");
+
+  return {
+    config: { wide_screen_mode: true },
+    header: { template: "turquoise" as never, title: plainText("会话状态", 1) },
+    elements: [{ tag: "markdown", content: mdLines.join("\n") }],
+  };
+}
+
+// ── Reply Card ───────────────────────────────────────────
+
+export async function replyCard(
+  client: Client,
+  messageId: string,
+  card: InteractiveCard,
+): Promise<string | undefined> {
+  const resp = await client.im.message.reply({
+    path: { message_id: messageId },
+    data: { content: JSON.stringify(card), msg_type: "interactive" },
+  });
+  return resp.data?.message_id;
+}
+
+// ── Markdown Card ────────────────────────────────────────
 
 const MAX_CARD_CONTENT = 8000;
 

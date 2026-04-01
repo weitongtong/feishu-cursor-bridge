@@ -40,10 +40,12 @@ export const config = {
     bin: process.env.CURSOR_BIN ?? "agent",
     /** 默认模型，不设则使用 Cursor CLI 默认 */
     defaultModel: process.env.DEFAULT_MODEL || undefined,
+    /** 队列排空时使用的默认模式 */
+    defaultMode: (process.env.DEFAULT_MODE as "agent" | "ask" | "plan" | "cloud" | undefined) ?? "plan",
   },
   /** 飞书单条文本消息的安全截断长度 */
   maxMessageLength: 4000,
-} as const;
+};
 
 function loadWorkspaces(): Map<string, string> {
   const file = path.resolve(process.cwd(), "workspaces.json");
@@ -63,6 +65,23 @@ function loadWorkspaces(): Map<string, string> {
 }
 
 export const workspaces = loadWorkspaces();
+
+/** 重新加载 workspaces.json，原地更新 Map，返回加载数量 */
+export function reloadWorkspaces(): number {
+  const file = path.resolve(process.cwd(), "workspaces.json");
+  workspaces.clear();
+  try {
+    const raw = fs.readFileSync(file, "utf-8");
+    const obj = JSON.parse(raw) as Record<string, string>;
+    for (const [alias, dir] of Object.entries(obj)) {
+      workspaces.set(alias.toLowerCase(), expandHome(dir));
+    }
+    console.log(`[config] 已重新加载 ${workspaces.size} 个工作区 (${file})`);
+  } catch {
+    console.warn(`[config] 重新加载失败，无法解析 workspaces.json`);
+  }
+  return workspaces.size;
+}
 
 /** 解析用户传入的路径，支持 ~ 展开 */
 export function resolveWorkDir(input: string): string {

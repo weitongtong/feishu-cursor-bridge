@@ -1,4 +1,4 @@
-import type { Client } from "@larksuiteoapi/node-sdk";
+import type { Client, InteractiveCard } from "@larksuiteoapi/node-sdk";
 import { config } from "./config.js";
 
 /** 将文本按最大长度拆分，尽量在换行处断开 */
@@ -83,6 +83,21 @@ export async function editMessage(
     data: {
       msg_type: "text",
       content: buildTextContent(truncated),
+    },
+  });
+}
+
+/** 编辑已发送的卡片消息（飞书 PATCH API，每条消息最多编辑 20 次） */
+export async function editCard(
+  client: Client,
+  messageId: string,
+  card: InteractiveCard,
+): Promise<void> {
+  await client.im.message.update({
+    path: { message_id: messageId },
+    data: {
+      msg_type: "interactive",
+      content: JSON.stringify(card),
     },
   });
 }

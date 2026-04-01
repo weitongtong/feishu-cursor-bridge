@@ -79,12 +79,15 @@ function describeStreamEvent(event: Record<string, unknown>, workDir: string): P
   return { category: "other", detail: label };
 }
 
+const PLAN_PROMPT_PREFIX =
+  "请以规划模式回复：分析需求并给出完整的实现方案，包括文件结构、关键代码和步骤，但不要实际修改任何文件。\n\n---\n\n";
+
 function buildArgs(opts: ExecuteOptions, stream: boolean): string[] {
   if (opts.mode === "cloud") {
     return ["-c", opts.prompt];
   }
 
-  const args: string[] = ["-p"];
+  const args: string[] = ["-p", "--trust"];
   if (opts.mode === "agent") {
     args.push("--force");
   }
@@ -93,7 +96,10 @@ function buildArgs(opts: ExecuteOptions, stream: boolean): string[] {
     args.push(`--resume=${opts.chatId}`);
   }
 
-  if (opts.mode !== "agent") {
+  if (opts.mode === "plan") {
+    // plan 模式实际以 ask（只读）执行，防止 -p 自动批准写入
+    args.push("--mode=ask");
+  } else if (opts.mode !== "agent") {
     args.push(`--mode=${opts.mode}`);
   }
 
@@ -103,7 +109,10 @@ function buildArgs(opts: ExecuteOptions, stream: boolean): string[] {
     args.push("--model", opts.model);
   }
 
-  args.push(opts.prompt);
+  const prompt = opts.mode === "plan"
+    ? PLAN_PROMPT_PREFIX + opts.prompt
+    : opts.prompt;
+  args.push(prompt);
   return args;
 }
 
