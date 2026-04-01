@@ -1,0 +1,20 @@
+{
+  "name": "feishu-cursor-bridge",
+  "version": "1.0.0",
+  "description": "飞书机器人对接 Cursor CLI 的桥接服务",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.45.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
