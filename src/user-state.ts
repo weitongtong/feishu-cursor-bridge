@@ -60,9 +60,17 @@ export function loadUserStates(): Map<string, PersistedState> {
   return map;
 }
 
-export function saveUserState(userId: string, state: PersistedState): void {
-  stateCache[userId] = { ...state };
+export function saveUserState(key: string, state: PersistedState): void {
+  stateCache[key] = { ...state };
+  schedulePersist();
+}
 
+export function deleteUserState(key: string): void {
+  delete stateCache[key];
+  schedulePersist();
+}
+
+function schedulePersist(): void {
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     debounceTimer = null;

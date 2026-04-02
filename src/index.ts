@@ -28,7 +28,7 @@ import {
   type StatusCardOptions,
 } from "./feishu-card.js";
 import { replyMessage, replyError, editCard } from "./feishu-reply.js";
-import { loadUserStates, saveUserState, type PersistedState, type ChatRecord } from "./user-state.js";
+import { loadUserStates, saveUserState, deleteUserState, type PersistedState, type ChatRecord } from "./user-state.js";
 
 const client = new Client({
   appId: config.feishu.appId,
@@ -63,6 +63,8 @@ interface QueuedMessage {
 }
 
 interface UserSession {
+  userId: string;
+  feishuChatId: string;
   workDir: string;
   model?: string;
   activeChatId?: string;
@@ -73,19 +75,38 @@ interface UserSession {
   inputBuffer: QueuedMessage[];
 }
 
+function sessionKey(userId: string, feishuChatId: string): string {
+  return `${userId}:${feishuChatId}`;
+}
+
 const sessions = new Map<string, UserSession>();
 const persistedStates = loadUserStates();
 
-function getSession(userId: string): UserSession {
-  let session = sessions.get(userId);
+function getSession(userId: string, feishuChatId: string): UserSession {
+  const key = sessionKey(userId, feishuChatId);
+  let session = sessions.get(key);
   if (!session) {
-    const persisted = persistedStates.get(userId);
+    let persisted = persistedStates.get(key);
+
+    if (!persisted) {
+      const legacyState = persistedStates.get(userId);
+      if (legacyState) {
+        persisted = legacyState;
+        persistedStates.set(key, legacyState);
+        persistedStates.delete(userId);
+        deleteUserState(userId);
+        console.log(`[state] 迁移旧 key ${userId.slice(0, 10)}... → ${key.slice(0, 20)}...`);
+      }
+    }
+
     let workDir = persisted?.workDir ?? config.cursor.defaultWorkDir;
     if (persisted?.workDir && (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory())) {
       console.warn(`[state] 用户 ${userId.slice(0, 10)}... 的工作区 ${workDir} 已不存在，回退到默认`);
       workDir = config.cursor.defaultWorkDir;
     }
     session = {
+      userId,
+      feishuChatId,
       workDir,
       model: persisted?.model ?? config.cursor.defaultModel,
       activeChatId: persisted?.activeChatId,
@@ -93,19 +114,20 @@ function getSession(userId: string): UserSession {
       messageQueue: [],
       inputBuffer: [],
     };
-    sessions.set(userId, session);
+    sessions.set(key, session);
   }
   return session;
 }
 
-function persistSession(userId: string, session: UserSession): void {
+function persistSession(session: UserSession): void {
+  const key = sessionKey(session.userId, session.feishuChatId);
   const state: PersistedState = {
     workDir: session.workDir,
     model: session.model,
     activeChatId: session.activeChatId,
     chats: session.chats,
   };
-  saveUserState(userId, state);
+  saveUserState(key, state);
 }
 
 // ── 输入缓冲 ─────────────────────────────────────────────
@@ -356,7 +378,6 @@ function isResumeError(output: string): boolean {
 
 async function executeCursorCommand(
   messageId: string,
-  userId: string,
   session: UserSession,
   mode: CursorMode,
   prompt: string,
@@ -370,7 +391,7 @@ async function executeCursorCommand(
   let chatId: string | undefined;
   try {
     chatId = await ensureChatId(session);
-    persistSession(userId, session);
+    persistSession(session);
   } catch (err) {
     console.error("[session] 创建会话失败，将以无上下文模式执行:", err);
   }
@@ -437,7 +458,7 @@ async function executeCursorCommand(
 
     try {
       const newChatId = await ensureChatId(session);
-      persistSession(userId, session);
+      persistSession(session);
       const newRecord = session.chats.find((c) => c.chatId === newChatId);
       updater.setSessionLabel(`${newRecord?.label ?? "chat"} (${newChatId.slice(0, 8)})`);
       const retry = await executeCursorStream(
@@ -467,7 +488,6 @@ async function executeCursorCommand(
 
 // ── 消息队列处理 ─────────────────────────────────────────
 async function drainMessageQueue(
-  userId: string,
   session: UserSession,
   lastMessageId: string,
 ): Promise<void> {
@@ -492,14 +512,14 @@ async function drainMessageQueue(
 
   session.activeTask = task;
   try {
-    await executeCursorCommand(replyTo, userId, session, mode, mergedPrompt);
+    await executeCursorCommand(replyTo, session, mode, mergedPrompt);
   } catch (err) {
     console.error("[queue] 队列消息执行失败:", err);
   } finally {
     session.activeTask = undefined;
   }
 
-  await drainMessageQueue(userId, session, replyTo);
+  await drainMessageQueue(session, replyTo);
 }
 
 // ── 事件分发 ─────────────────────────────────────────────
@@ -534,7 +554,7 @@ async function handleMessage(data: {
   if (!text) return;
 
   const userId = sender.sender_id?.open_id ?? "unknown";
-  const session = getSession(userId);
+  const session = getSession(userId, message.chat_id);
   const command = parseCommand(text);
 
   const cmdLabel = command.type === "cursor" ? `${command.type} (${command.mode})` : command.type;
@@ -633,7 +653,7 @@ async function handleMessage(data: {
       if (command.label) {
         session.nextChatLabel = command.label;
       }
-      persistSession(userId, session);
+      persistSession(session);
       const labelHint = command.label ? `标签: ${command.label}\n` : "";
       await replyMessage(
         client,
@@ -663,7 +683,7 @@ async function handleMessage(data: {
       clearBuffer(session);
       session.activeChatId = target.chatId;
       session.messageQueue = [];
-      persistSession(userId, session);
+      persistSession(session);
       await replyMessage(
         client,
         message.message_id,
@@ -709,7 +729,7 @@ async function handleMessage(data: {
       session.workDir = targetDir;
       session.activeChatId = undefined;
       session.messageQueue = [];
-      persistSession(userId, session);
+      persistSession(session);
       const existingChats = session.chats.filter((c) => c.workDir === targetDir).length;
       const chatHint = existingChats > 0
         ? `该工作区已有 ${existingChats} 个 chat，发 \`/chat\` 查看并选择。`
@@ -724,7 +744,7 @@ async function handleMessage(data: {
 
     case "model": {
       session.model = command.model;
-      persistSession(userId, session);
+      persistSession(session);
       await replyMessage(
         client,
         message.message_id,
@@ -740,26 +760,36 @@ async function handleMessage(data: {
     }
 
     case "chats-global": {
-      const allUserIds = new Set<string>([...sessions.keys(), ...persistedStates.keys()]);
+      const allKeys = new Set<string>([...sessions.keys(), ...persistedStates.keys()]);
 
-      if (allUserIds.size === 0) {
+      if (allKeys.size === 0) {
         await replyCard(client, message.message_id, buildInfoCard("全局 Chat 概览", "当前无任何记录。"));
         break;
       }
 
-      const lines: string[] = [];
-      let idx = 1;
-      for (const uid of allUserIds) {
-        const s = sessions.get(uid);
-        const p = persistedStates.get(uid);
+      interface SessionSummary {
+        key: string;
+        feishuChatId: string;
+        workDir: string;
+        model: string;
+        allChats: ChatRecord[];
+        activeChatId?: string;
+        taskInfo: string;
+        extra: string[];
+      }
+
+      const byUser = new Map<string, SessionSummary[]>();
+      for (const key of allKeys) {
+        const colonIdx = key.indexOf(":");
+        const uid = colonIdx >= 0 ? key.slice(0, colonIdx) : key;
+        const fChatId = colonIdx >= 0 ? key.slice(colonIdx + 1) : "p2p";
+
+        const s = sessions.get(key);
+        const p = persistedStates.get(key);
         const workDir = s?.workDir ?? p?.workDir ?? config.cursor.defaultWorkDir;
         const model = s?.model ?? p?.model ?? "Cursor 默认";
         const allChats = s?.chats ?? p?.chats ?? [];
         const activeChatId = s?.activeChatId ?? p?.activeChatId;
-        const activeChat = allChats.find((c) => c.chatId === activeChatId);
-        const chatStatus = activeChat
-          ? `${activeChat.label} (${activeChat.chatId.slice(0, 8)})`
-          : "无活跃 chat";
 
         let taskInfo = "空闲";
         if (s?.activeTask) {
@@ -770,17 +800,33 @@ async function handleMessage(data: {
         if (s?.inputBuffer.length) extra.push(`暂存 ${s.inputBuffer.length}`);
         if (s?.messageQueue.length) extra.push(`排队 ${s.messageQueue.length}`);
 
-        lines.push(
-          `**${idx}.** \`${uid.slice(0, 10)}…\``,
-          `　工作区: ${getWorkspaceLabel(workDir)} · 模型: ${model}`,
-          `　当前 Chat: ${chatStatus} · Chat 总数: ${allChats.length}`,
-          `　状态: ${taskInfo}${extra.length ? ` · ${extra.join(" / ")}` : ""}`,
-          "",
-        );
+        const summary: SessionSummary = { key, feishuChatId: fChatId, workDir, model, allChats, activeChatId, taskInfo, extra };
+        const list = byUser.get(uid) ?? [];
+        list.push(summary);
+        byUser.set(uid, list);
+      }
+
+      const lines: string[] = [];
+      let idx = 1;
+      for (const [uid, summaries] of byUser) {
+        lines.push(`**${idx}.** \`${uid.slice(0, 10)}…\` (${summaries.length} 个会话)`);
+        for (const sm of summaries) {
+          const activeChat = sm.activeChatId ? sm.allChats.find((c) => c.chatId === sm.activeChatId) : undefined;
+          const chatStatus = activeChat
+            ? `${activeChat.label} (${activeChat.chatId.slice(0, 8)})`
+            : "无活跃 chat";
+          lines.push(
+            `　飞书会话: \`${sm.feishuChatId.slice(0, 10)}…\``,
+            `　工作区: ${getWorkspaceLabel(sm.workDir)} · 模型: ${sm.model}`,
+            `　当前 Chat: ${chatStatus} · Chat 总数: ${sm.allChats.length}`,
+            `　状态: ${sm.taskInfo}${sm.extra.length ? ` · ${sm.extra.join(" / ")}` : ""}`,
+          );
+        }
+        lines.push("");
         idx++;
       }
 
-      lines.unshift(`共 **${allUserIds.size}** 个用户\n`);
+      lines.unshift(`共 **${byUser.size}** 个用户，**${allKeys.size}** 个会话\n`);
       await replyCard(client, message.message_id, buildInfoCard("全局 Chat 概览", lines.join("\n")));
       break;
     }
@@ -837,14 +883,14 @@ async function handleMessage(data: {
 
       session.activeTask = task;
       try {
-        await executeCursorCommand(message.message_id, userId, session, command.mode, prompt);
+        await executeCursorCommand(message.message_id, session, command.mode, prompt);
       } catch (err) {
         console.error("[cursor] 执行异常:", err);
       } finally {
         session.activeTask = undefined;
       }
 
-      await drainMessageQueue(userId, session, message.message_id);
+      await drainMessageQueue(session, message.message_id);
       break;
     }
   }
