@@ -24,8 +24,22 @@ export interface StatusCommand {
   type: "status";
 }
 
-export interface NewSessionCommand {
-  type: "new";
+export interface ChatListCommand {
+  type: "chat-list";
+}
+
+export interface ChatNewCommand {
+  type: "chat-new";
+  label?: string;
+}
+
+export interface ChatSwitchCommand {
+  type: "chat-switch";
+  target: string;
+}
+
+export interface ChatsGlobalCommand {
+  type: "chats-global";
 }
 
 export interface WsCommand {
@@ -51,7 +65,10 @@ export type Command =
   | ModelCommand
   | HelpCommand
   | StatusCommand
-  | NewSessionCommand
+  | ChatListCommand
+  | ChatNewCommand
+  | ChatSwitchCommand
+  | ChatsGlobalCommand
   | WsCommand
   | CancelCommand
   | WsSwitchCommand
@@ -92,7 +109,25 @@ export function parseCommand(text: string): Command {
   }
 
   if (trimmed === "/new") {
-    return { type: "new" };
+    return { type: "chat-new" };
+  }
+
+  if (trimmed === "/chat") {
+    return { type: "chat-list" };
+  }
+  if (trimmed.startsWith("/chat ")) {
+    const arg = trimmed.slice(6).trim();
+    if (arg === "new") {
+      return { type: "chat-new" };
+    }
+    if (arg.startsWith("new ")) {
+      return { type: "chat-new", label: arg.slice(4).trim() || undefined };
+    }
+    return { type: "chat-switch", target: arg };
+  }
+
+  if (trimmed === "/chats") {
+    return { type: "chats-global" };
   }
 
   if (trimmed === "/ws") {
@@ -155,11 +190,18 @@ export const HELP_TEXT = `**使用方式**
 - \`/ask\` [问题] → 只读问答，不改任何文件
 - \`/cloud\` [任务] → 提交到 Cloud Agent
 
+**Chat 管理**
+
+- \`/chat\` → 列出当前工作区下的所有 chat
+- \`/chat new\` [标签] → 新建 chat（旧 chat 保留）
+- \`/chat\` <标签或编号> → 切换到指定 chat
+- \`/new\` → \`/chat new\` 的快捷方式
+- \`/chats\` → 查看所有用户的全局 chat 概览
+
 **上下文管理**
 
-- \`/new\` → 清除当前会话，重新开始
 - \`/cancel\` → 取消任务或清空暂存消息
-- \`/status\` → 查看当前会话状态
+- \`/status\` → 查看当前工作区和 chat 状态
 - \`/model\` <名称> → 切换模型
 
 **工作区管理**

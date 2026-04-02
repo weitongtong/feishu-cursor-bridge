@@ -1,6 +1,41 @@
 import type { Client, InteractiveCard } from "@larksuiteoapi/node-sdk";
 import { config } from "./config.js";
 
+// ── 重试工具 ─────────────────────────────────────────────
+
+const RETRYABLE_MESSAGES = [
+  "socket disconnected",
+  "socket hang up",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+];
+
+function isRetryableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return RETRYABLE_MESSAGES.some((k) => msg.includes(k));
+}
+
+export async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries && isRetryableError(err)) {
+        const delay = 500 * 2 ** attempt;
+        console.warn(`[retry] 飞书 API 调用失败 (${attempt + 1}/${maxRetries + 1})，${delay}ms 后重试:`, err instanceof Error ? err.message : err);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 /** 将文本按最大长度拆分，尽量在换行处断开 */
 function splitText(text: string, maxLen: number): string[] {
   if (text.length <= maxLen) return [text];
@@ -36,13 +71,15 @@ async function sendReply(
   messageId: string,
   text: string
 ): Promise<string | undefined> {
-  const resp = await client.im.message.reply({
-    path: { message_id: messageId },
-    data: {
-      content: buildTextContent(text),
-      msg_type: "text",
-    },
-  });
+  const resp = await withRetry(() =>
+    client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content: buildTextContent(text),
+        msg_type: "text",
+      },
+    }),
+  );
   return resp.data?.message_id;
 }
 
@@ -78,13 +115,15 @@ export async function editMessage(
       ? text.slice(0, config.maxMessageLength - 20) + "\n\n...(内容过长已截断)"
       : text;
 
-  await client.im.message.update({
-    path: { message_id: messageId },
-    data: {
-      msg_type: "text",
-      content: buildTextContent(truncated),
-    },
-  });
+  await withRetry(() =>
+    client.im.message.update({
+      path: { message_id: messageId },
+      data: {
+        msg_type: "text",
+        content: buildTextContent(truncated),
+      },
+    }),
+  );
 }
 
 /** 编辑已发送的卡片消息（飞书 PATCH API，每条消息最多编辑 20 次） */
@@ -93,13 +132,14 @@ export async function editCard(
   messageId: string,
   card: InteractiveCard,
 ): Promise<void> {
-  await client.im.message.update({
-    path: { message_id: messageId },
-    data: {
-      msg_type: "interactive",
-      content: JSON.stringify(card),
-    },
-  });
+  await withRetry(() =>
+    client.im.message.patch({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify(card),
+      },
+    }),
+  );
 }
 
 /** 回复错误信息 */

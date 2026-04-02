@@ -1,6 +1,6 @@
 import type { Client, InteractiveCard } from "@larksuiteoapi/node-sdk";
 import { getModeLabel, type CursorMode } from "./command-parser.js";
-import { replyMessage } from "./feishu-reply.js";
+import { replyMessage, withRetry } from "./feishu-reply.js";
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -114,13 +114,15 @@ export interface SessionCardOptions {
   activeTaskInfo?: string;
   bufferCount?: number;
   queueCount?: number;
+  chatCount?: number;
 }
 
 export function buildSessionCard(options: SessionCardOptions): InteractiveCard {
   const mdLines: string[] = [
     `**工作区**: ${options.workspaceLabel}`,
     `**模型**: ${options.model ?? "Cursor 默认"}`,
-    `**会话**: ${options.sessionLabel}`,
+    `**当前 Chat**: ${options.sessionLabel}`,
+    `**Chat 总数**: ${options.chatCount ?? 0}`,
     `**运行中**: ${options.activeTaskInfo ?? "无"}`,
   ];
 
@@ -131,11 +133,11 @@ export function buildSessionCard(options: SessionCardOptions): InteractiveCard {
     mdLines.push(`**排队消息**: ${options.queueCount} 条`);
   }
 
-  mdLines.push("", "**推荐流程**: 发送任务 → `/plan` 规划 → `/agent` 执行");
+  mdLines.push("", "发 `/chat` 查看所有 chat，`/chat new` 新建。");
 
   return {
     config: { wide_screen_mode: true },
-    header: { template: "turquoise" as never, title: plainText("会话状态", 1) },
+    header: { template: "turquoise" as never, title: plainText("当前状态", 1) },
     elements: [{ tag: "markdown", content: mdLines.join("\n") }],
   };
 }
@@ -147,10 +149,12 @@ export async function replyCard(
   messageId: string,
   card: InteractiveCard,
 ): Promise<string | undefined> {
-  const resp = await client.im.message.reply({
-    path: { message_id: messageId },
-    data: { content: JSON.stringify(card), msg_type: "interactive" },
-  });
+  const resp = await withRetry(() =>
+    client.im.message.reply({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(card), msg_type: "interactive" },
+    }),
+  );
   return resp.data?.message_id;
 }
 
