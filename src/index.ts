@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import {
   Client,
   EventDispatcher,
@@ -28,6 +29,7 @@ import {
   type StatusCardOptions,
 } from "./feishu-card.js";
 import { replyMessage, replyError, editCard } from "./feishu-reply.js";
+import { downloadMessageImage, extractImageKey, IMAGE_DIR_NAME } from "./feishu-image.js";
 import { loadUserStates, saveUserState, deleteUserState, type PersistedState, type ChatRecord } from "./user-state.js";
 
 const client = new Client({
@@ -136,8 +138,15 @@ function clearBuffer(session: UserSession): QueuedMessage[] {
   return session.inputBuffer.splice(0);
 }
 
+const IMAGE_REF_MARKER = "[图片已保存:";
+const IMAGE_PROMPT_HINT = "\n\n（上述路径指向的图片文件已保存在工作区中，请使用文件读取工具查看图片内容。）";
+
 function mergeBufferText(buffer: QueuedMessage[]): string {
-  return buffer.map((m) => m.text).join("\n");
+  const merged = buffer.map((m) => m.text).join("\n");
+  if (merged.includes(IMAGE_REF_MARKER)) {
+    return merged + IMAGE_PROMPT_HINT;
+  }
+  return merged;
 }
 
 // ── 工具函数 ──────────────────────────────────────────────
@@ -541,11 +550,39 @@ async function handleMessage(data: {
     if (!mentioned) return;
   }
 
+  const userId = sender.sender_id?.open_id ?? "unknown";
+
+  if (message.message_type === "image") {
+    const session = getSession(userId, message.chat_id);
+    const imageKey = extractImageKey(message.content);
+    if (!imageKey) {
+      await replyMessage(client, message.message_id, "图片消息解析失败，请重试。");
+      return;
+    }
+    try {
+      const destDir = path.join(session.workDir, IMAGE_DIR_NAME);
+      const filePath = await downloadMessageImage(client, message.message_id, imageKey, destDir);
+      session.inputBuffer.push({ text: `[图片已保存: ${filePath}]`, messageId: message.message_id });
+      const count = session.inputBuffer.length;
+      await replyMessage(
+        client,
+        message.message_id,
+        count === 1
+          ? `已接收图片。继续发送补充，或发 /plan 开始规划。`
+          : `已接收图片 (共 ${count} 条暂存)`,
+      );
+    } catch (err) {
+      console.error("[image] 下载图片失败:", err);
+      await replyMessage(client, message.message_id, "图片下载失败，请重试或改为文字描述。");
+    }
+    return;
+  }
+
   if (message.message_type !== "text") {
     await replyMessage(
       client,
       message.message_id,
-      "暂时只支持文本消息，请发送文字指令。",
+      "暂时只支持文本和图片消息，请发送文字指令或图片。",
     );
     return;
   }
@@ -553,7 +590,6 @@ async function handleMessage(data: {
   const text = extractTextFromContent(message.content);
   if (!text) return;
 
-  const userId = sender.sender_id?.open_id ?? "unknown";
   const session = getSession(userId, message.chat_id);
   const command = parseCommand(text);
 

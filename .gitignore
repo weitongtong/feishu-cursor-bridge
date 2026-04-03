@@ -3,3 +3,4 @@ dist/
 .env
 workspaces.json
 user-state.json
+.cursor-images/
