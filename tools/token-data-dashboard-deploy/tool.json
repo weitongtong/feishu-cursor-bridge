@@ -1,0 +1,6 @@
+{
+  "name": "deploy-dashboard",
+  "aliases": ["部署token-data-dashboard项目", "部署dashboard"],
+  "description": "部署 token-data-dashboard 到生产服务器",
+  "entry": "deploy.sh"
+}

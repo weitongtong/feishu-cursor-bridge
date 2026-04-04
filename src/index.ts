@@ -1,10 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import {
-  Client,
-  EventDispatcher,
-  WSClient,
-} from "@larksuiteoapi/node-sdk";
+import { Client, EventDispatcher, WSClient } from "@larksuiteoapi/node-sdk";
 import { config, workspaces, reloadWorkspaces } from "./config.js";
 import {
   extractTextFromContent,
@@ -29,8 +25,27 @@ import {
   type StatusCardOptions,
 } from "./feishu-card.js";
 import { replyMessage, replyError, editCard } from "./feishu-reply.js";
-import { downloadMessageImage, extractImageKey, IMAGE_DIR_NAME } from "./feishu-image.js";
-import { loadUserStates, saveUserState, deleteUserState, type PersistedState, type ChatRecord } from "./user-state.js";
+import {
+  downloadMessageImage,
+  extractImageKey,
+  IMAGE_DIR_NAME,
+} from "./feishu-image.js";
+import {
+  loadUserStates,
+  saveUserState,
+  deleteUserState,
+  type PersistedState,
+  type ChatRecord,
+} from "./user-state.js";
+import {
+  loadTools,
+  reloadTools,
+  getToolList,
+  findTool,
+  matchToolByAlias,
+  executeTool,
+  type ToolDefinition,
+} from "./tool-registry.js";
 
 const client = new Client({
   appId: config.feishu.appId,
@@ -41,9 +56,29 @@ const client = new Client({
 const handledMessages = new Set<string>();
 
 function isDuplicate(messageId: string): boolean {
-  if (handledMessages.has(messageId)) return true;
+  if (handledMessages.has(messageId)) {
+    console.warn(`[dedup] 重复消息已跳过: ${messageId}`);
+    return true;
+  }
   handledMessages.add(messageId);
   setTimeout(() => handledMessages.delete(messageId), 10 * 60 * 1000);
+  return false;
+}
+
+// ── 内容级去重（防御不同 message_id 的重复消息）──────────
+const CONTENT_DEDUP_WINDOW_MS = 10_000;
+const recentContents = new Map<string, number>();
+
+function isContentDuplicate(userId: string, text: string): boolean {
+  const key = `${userId}:${text}`;
+  const lastTime = recentContents.get(key);
+  const now = Date.now();
+  if (lastTime && now - lastTime < CONTENT_DEDUP_WINDOW_MS) {
+    console.warn(`[dedup] 内容级重复已跳过: ${key.slice(0, 40)}`);
+    return true;
+  }
+  recentContents.set(key, now);
+  setTimeout(() => recentContents.delete(key), CONTENT_DEDUP_WINDOW_MS);
   return false;
 }
 
@@ -56,6 +91,7 @@ interface TaskRecord {
   chatType: string;
   statusCardMessageId?: string;
   abortController?: AbortController;
+  toolName?: string;
 }
 
 interface QueuedMessage {
@@ -97,13 +133,20 @@ function getSession(userId: string, feishuChatId: string): UserSession {
         persistedStates.set(key, legacyState);
         persistedStates.delete(userId);
         deleteUserState(userId);
-        console.log(`[state] 迁移旧 key ${userId.slice(0, 10)}... → ${key.slice(0, 20)}...`);
+        console.log(
+          `[state] 迁移旧 key ${userId.slice(0, 10)}... → ${key.slice(0, 20)}...`,
+        );
       }
     }
 
     let workDir = persisted?.workDir ?? config.cursor.defaultWorkDir;
-    if (persisted?.workDir && (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory())) {
-      console.warn(`[state] 用户 ${userId.slice(0, 10)}... 的工作区 ${workDir} 已不存在，回退到默认`);
+    if (
+      persisted?.workDir &&
+      (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory())
+    ) {
+      console.warn(
+        `[state] 用户 ${userId.slice(0, 10)}... 的工作区 ${workDir} 已不存在，回退到默认`,
+      );
       workDir = config.cursor.defaultWorkDir;
     }
     session = {
@@ -139,7 +182,8 @@ function clearBuffer(session: UserSession): QueuedMessage[] {
 }
 
 const IMAGE_REF_MARKER = "[图片已保存:";
-const IMAGE_PROMPT_HINT = "\n\n（上述路径指向的图片文件已保存在工作区中，请使用文件读取工具查看图片内容。）";
+const IMAGE_PROMPT_HINT =
+  "\n\n（上述路径指向的图片文件已保存在工作区中，请使用文件读取工具查看图片内容。）";
 
 function mergeBufferText(buffer: QueuedMessage[]): string {
   const merged = buffer.map((m) => m.text).join("\n");
@@ -188,7 +232,13 @@ function formatDurationMs(durationMs?: number): string | undefined {
   return `${minutes}m${rest}s`;
 }
 
-function renderSummary(counts: { read: number; write: number; command: number; search: number; other: number }): string {
+function renderSummary(counts: {
+  read: number;
+  write: number;
+  command: number;
+  search: number;
+  other: number;
+}): string {
   const parts: string[] = [];
   if (counts.read) parts.push(`读取 ${counts.read}`);
   if (counts.write) parts.push(`编辑 ${counts.write}`);
@@ -214,11 +264,17 @@ function renderWorkspaceList(session: UserSession): string {
   return lines.join("\n");
 }
 
+function getTaskLabel(task: TaskRecord): string {
+  return task.toolName ? `工具 ${task.toolName}` : getModeLabel(task.mode);
+}
+
 function isSessionMutable(command: Command): boolean {
-  return command.type === "chat-new"
-    || command.type === "chat-switch"
-    || command.type === "ws-switch"
-    || command.type === "model";
+  return (
+    command.type === "chat-new" ||
+    command.type === "chat-switch" ||
+    command.type === "ws-switch" ||
+    command.type === "model"
+  );
 }
 
 // ── 实时状态面板 (卡片模式) ──────────────────────────────
@@ -247,7 +303,13 @@ class CardProgressUpdater {
     feishuClient: Client,
     originMessageId: string,
     progressMessageId: string,
-    options: { workDir: string; mode: CursorMode; prompt: string; sessionLabel: string; model?: string },
+    options: {
+      workDir: string;
+      mode: CursorMode;
+      prompt: string;
+      sessionLabel: string;
+      model?: string;
+    },
   ) {
     this.client = feishuClient;
     this.originMessageId = originMessageId;
@@ -274,10 +336,7 @@ class CardProgressUpdater {
     this.scheduleFlush();
   }
 
-  private buildCard(
-    status: StatusCardOptions["status"],
-    note?: string,
-  ) {
+  private buildCard(status: StatusCardOptions["status"], note?: string) {
     return buildStatusCard({
       mode: this.mode,
       prompt: this.prompt,
@@ -306,7 +365,11 @@ class CardProgressUpdater {
 
   private async flush() {
     if (this.editCount >= MAX_EDITS_PER_MSG) {
-      const newId = await replyCard(this.client, this.originMessageId, this.buildCard("running"));
+      const newId = await replyCard(
+        this.client,
+        this.originMessageId,
+        this.buildCard("running"),
+      );
       if (newId) {
         this.currentMessageId = newId;
         this.editCount = 0;
@@ -315,7 +378,11 @@ class CardProgressUpdater {
     }
     this.editCount++;
     this.lastEditTime = Date.now();
-    await editCard(this.client, this.currentMessageId, this.buildCard("running")).catch(console.error);
+    await editCard(
+      this.client,
+      this.currentMessageId,
+      this.buildCard("running"),
+    ).catch(console.error);
   }
 
   async finalize(result: ExecuteResult) {
@@ -328,22 +395,35 @@ class CardProgressUpdater {
       this.timer = null;
     }
 
-    const dur = formatDurationMs(result.durationMs) ?? formatElapsed(this.startTime);
+    const dur =
+      formatDurationMs(result.durationMs) ?? formatElapsed(this.startTime);
 
     const cardStatus: StatusCardOptions["status"] = result.cancelled
       ? "cancelled"
       : result.success
-        ? result.isCloud ? "submitted" : "success"
+        ? result.isCloud
+          ? "submitted"
+          : "success"
         : "error";
 
     this.currentActivity = `耗时 ${dur}`;
 
     let note: string | undefined;
-    if (this.mode === "agent" && result.success && !result.isCloud && !result.cancelled) {
-      note = "继续发消息可在同一 chat 中追加需求，发 `/chat new` 开启新 chat，发 `/chat` 查看所有 chat。";
+    if (
+      this.mode === "agent" &&
+      result.success &&
+      !result.isCloud &&
+      !result.cancelled
+    ) {
+      note =
+        "继续发消息可在同一 chat 中追加需求，发 `/chat new` 开启新 chat，发 `/chat` 查看所有 chat。";
     }
 
-    await editCard(this.client, this.currentMessageId, this.buildCard(cardStatus, note)).catch(console.error);
+    await editCard(
+      this.client,
+      this.currentMessageId,
+      this.buildCard(cardStatus, note),
+    ).catch(console.error);
 
     if (result.output && !result.cancelled) {
       await replyMarkdownCard(this.client, this.originMessageId, result.output);
@@ -353,7 +433,9 @@ class CardProgressUpdater {
 
 // ── Cursor 指令处理 ──────────────────────────────────────
 function generateChatLabel(session: UserSession): string {
-  const workDirChats = session.chats.filter((c) => c.workDir === session.workDir);
+  const workDirChats = session.chats.filter(
+    (c) => c.workDir === session.workDir,
+  );
   const base = `chat-${workDirChats.length + 1}`;
   const existing = new Set(workDirChats.map((c) => c.label));
   if (!existing.has(base)) return base;
@@ -371,18 +453,25 @@ async function ensureChatId(session: UserSession): Promise<string> {
   const chatId = await createChat(session.workDir);
   const label = session.nextChatLabel || generateChatLabel(session);
   session.nextChatLabel = undefined;
-  session.chats.push({ chatId, label, workDir: session.workDir, createdAt: Date.now() });
+  session.chats.push({
+    chatId,
+    label,
+    workDir: session.workDir,
+    createdAt: Date.now(),
+  });
   session.activeChatId = chatId;
   return chatId;
 }
 
 function isResumeError(output: string): boolean {
   const lower = output.toLowerCase();
-  return lower.includes("chat not found")
-    || lower.includes("invalid chat")
-    || lower.includes("no such chat")
-    || lower.includes("resume")
-    || lower.includes("does not exist");
+  return (
+    lower.includes("chat not found") ||
+    lower.includes("invalid chat") ||
+    lower.includes("no such chat") ||
+    lower.includes("resume") ||
+    lower.includes("does not exist")
+  );
 }
 
 async function executeCursorCommand(
@@ -405,7 +494,9 @@ async function executeCursorCommand(
     console.error("[session] 创建会话失败，将以无上下文模式执行:", err);
   }
 
-  const activeRecord = chatId ? session.chats.find((c) => c.chatId === chatId) : undefined;
+  const activeRecord = chatId
+    ? session.chats.find((c) => c.chatId === chatId)
+    : undefined;
   const sessionLabel = activeRecord
     ? `${activeRecord.label} (${chatId!.slice(0, 8)})`
     : "独立执行";
@@ -454,9 +545,18 @@ async function executeCursorCommand(
     signal,
   );
 
-  if (!result.success && !result.cancelled && chatId && isResumeError(result.output)) {
+  if (
+    !result.success &&
+    !result.cancelled &&
+    chatId &&
+    isResumeError(result.output)
+  ) {
     if (signal.aborted) {
-      await updater.finalize({ ...result, cancelled: true, output: "任务已取消。" });
+      await updater.finalize({
+        ...result,
+        cancelled: true,
+        output: "任务已取消。",
+      });
       return { ...result, cancelled: true, output: "任务已取消。" };
     }
 
@@ -469,7 +569,9 @@ async function executeCursorCommand(
       const newChatId = await ensureChatId(session);
       persistSession(session);
       const newRecord = session.chats.find((c) => c.chatId === newChatId);
-      updater.setSessionLabel(`${newRecord?.label ?? "chat"} (${newChatId.slice(0, 8)})`);
+      updater.setSessionLabel(
+        `${newRecord?.label ?? "chat"} (${newChatId.slice(0, 8)})`,
+      );
       const retry = await executeCursorStream(
         {
           prompt,
@@ -508,8 +610,14 @@ async function drainMessageQueue(
   const explicitMode = [...queued].reverse().find((m) => m.mode)?.mode;
   const mode = explicitMode ?? (config.cursor.defaultMode as CursorMode);
 
-  console.log(`[queue] 合并 ${queued.length} 条排队消息，以 ${mode} 模式继续${explicitMode ? " (用户指定)" : ""}`);
-  await replyMessage(client, replyTo, `前序任务已完成，正在处理你排队的 ${queued.length} 条消息...`);
+  console.log(
+    `[queue] 合并 ${queued.length} 条排队消息，以 ${mode} 模式继续${explicitMode ? " (用户指定)" : ""}`,
+  );
+  await replyMessage(
+    client,
+    replyTo,
+    `前序任务已完成，正在处理你排队的 ${queued.length} 条消息...`,
+  );
 
   const task: TaskRecord = {
     mode,
@@ -529,6 +637,122 @@ async function drainMessageQueue(
   }
 
   await drainMessageQueue(session, replyTo);
+}
+
+// ── 工具执行 ─────────────────────────────────────────────
+
+const MAX_OUTPUT_PER_CARD = 7500;
+
+function splitOutputToCodeBlocks(output: string): string[] {
+  if (output.length <= MAX_OUTPUT_PER_CARD) {
+    return [`\`\`\`\n${output}\n\`\`\``];
+  }
+
+  const lines = output.split("\n");
+  const blocks: string[] = [];
+  let current: string[] = [];
+  let currentLen = 0;
+
+  for (const line of lines) {
+    if (currentLen + line.length + 1 > MAX_OUTPUT_PER_CARD && current.length > 0) {
+      blocks.push(`\`\`\`\n${current.join("\n")}\n\`\`\``);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(line);
+    currentLen += line.length + 1;
+  }
+  if (current.length > 0) {
+    blocks.push(`\`\`\`\n${current.join("\n")}\n\`\`\``);
+  }
+
+  return blocks;
+}
+
+async function executeToolCommand(
+  messageId: string,
+  chatType: string,
+  session: UserSession,
+  query: string,
+): Promise<void> {
+  const tool = typeof query === "string" ? findTool(query) : undefined;
+  if (!tool) {
+    const tools = getToolList();
+    const available =
+      tools.length > 0
+        ? "\n\n可用工具: " +
+          tools.map((t, i) => `${i + 1}. ${t.name}`).join("、")
+        : "\n\n尚未定义任何工具。";
+    await replyMessage(
+      client,
+      messageId,
+      `未找到工具 '${query}'。${available}`,
+    );
+    return;
+  }
+
+  const abortController = new AbortController();
+  const task: TaskRecord = {
+    mode: "agent",
+    prompt: tool.description || tool.name,
+    startedAt: Date.now(),
+    originMessageId: messageId,
+    chatType,
+    toolName: tool.name,
+    abortController,
+  };
+
+  session.activeTask = task;
+
+  const initialCard = buildInfoCard(
+    "工具执行中",
+    `**工具**: ${tool.name}\n**描述**: ${tool.description || "无"}\n**脚本**: ${tool.id}/${tool.entry.split("/").pop()}\n\n正在执行...`,
+    "indigo",
+  );
+  const cardMsgId = await replyCard(client, messageId, initialCard);
+
+  try {
+    const result = await executeTool(tool, abortController.signal);
+    const dur = formatDurationMs(result.durationMs) ?? "未知";
+
+    if (cardMsgId) {
+      const finalCard = buildInfoCard(
+        result.success ? "工具执行成功" : "工具执行失败",
+        `**工具**: ${tool.name}\n**耗时**: ${dur}`,
+        result.success ? "green" : "red",
+      );
+      await editCard(client, cardMsgId, finalCard).catch(console.error);
+    }
+
+    const outputText = result.output.trim();
+    if (outputText) {
+      const blocks = splitOutputToCodeBlocks(outputText);
+      for (const block of blocks) {
+        await replyMarkdownCard(client, messageId, block);
+      }
+    }
+
+    if (!result.success) {
+      console.error(
+        `[tool] ${tool.name} 执行失败 (${dur}):`,
+        result.output.slice(0, 200),
+      );
+    } else {
+      console.log(`[tool] ${tool.name} 执行成功 (${dur})`);
+    }
+  } catch (err) {
+    console.error(`[tool] ${tool.name} 执行异常:`, err);
+    if (cardMsgId) {
+      const errCard = buildInfoCard(
+        "工具执行失败",
+        `**工具**: ${tool.name}\n**错误**: ${err instanceof Error ? err.message : String(err)}`,
+        "red",
+      );
+      await editCard(client, cardMsgId, errCard).catch(console.error);
+    }
+  } finally {
+    session.activeTask = undefined;
+  }
 }
 
 // ── 事件分发 ─────────────────────────────────────────────
@@ -556,13 +780,25 @@ async function handleMessage(data: {
     const session = getSession(userId, message.chat_id);
     const imageKey = extractImageKey(message.content);
     if (!imageKey) {
-      await replyMessage(client, message.message_id, "图片消息解析失败，请重试。");
+      await replyMessage(
+        client,
+        message.message_id,
+        "图片消息解析失败，请重试。",
+      );
       return;
     }
     try {
       const destDir = path.join(session.workDir, IMAGE_DIR_NAME);
-      const filePath = await downloadMessageImage(client, message.message_id, imageKey, destDir);
-      session.inputBuffer.push({ text: `[图片已保存: ${filePath}]`, messageId: message.message_id });
+      const filePath = await downloadMessageImage(
+        client,
+        message.message_id,
+        imageKey,
+        destDir,
+      );
+      session.inputBuffer.push({
+        text: `[图片已保存: ${filePath}]`,
+        messageId: message.message_id,
+      });
       const count = session.inputBuffer.length;
       await replyMessage(
         client,
@@ -573,7 +809,11 @@ async function handleMessage(data: {
       );
     } catch (err) {
       console.error("[image] 下载图片失败:", err);
-      await replyMessage(client, message.message_id, "图片下载失败，请重试或改为文字描述。");
+      await replyMessage(
+        client,
+        message.message_id,
+        "图片下载失败，请重试或改为文字描述。",
+      );
     }
     return;
   }
@@ -589,22 +829,41 @@ async function handleMessage(data: {
 
   const text = extractTextFromContent(message.content);
   if (!text) return;
+  if (isContentDuplicate(userId, text)) return;
 
   const session = getSession(userId, message.chat_id);
   const command = parseCommand(text);
 
-  const cmdLabel = command.type === "cursor" ? `${command.type} (${command.mode})` : command.type;
-  console.log(`[msg] ${userId.slice(0, 10)}... | ${cmdLabel} | ${text.slice(0, 80)}`);
+  const cmdLabel =
+    command.type === "cursor"
+      ? `${command.type} (${command.mode})`
+      : command.type;
+  console.log(
+    `[msg] ${message.message_id} | ${userId.slice(0, 10)}... | ${cmdLabel} | ${text.slice(0, 80)}`,
+  );
 
   if (session.activeTask) {
-    if (command.type === "cursor" || command.type === "input") {
-      const queueText = command.type === "cursor" ? command.prompt : command.text;
-      const queueMode = command.type === "cursor" ? command.mode : undefined;
-      session.messageQueue.push({ text: queueText, messageId: message.message_id, mode: queueMode });
+    if (command.type === "tool-run") {
       await replyMessage(
         client,
         message.message_id,
-        `当前正在执行 ${getModeLabel(session.activeTask.mode)} 任务，你的消息已记录（队列中 ${session.messageQueue.length} 条），完成后会自动继续。`,
+        `当前正在执行 ${getTaskLabel(session.activeTask)} 任务，请等待完成后再操作，或先发送 /cancel 取消。`,
+      );
+      return;
+    }
+    if (command.type === "cursor" || command.type === "input") {
+      const queueText =
+        command.type === "cursor" ? command.prompt : command.text;
+      const queueMode = command.type === "cursor" ? command.mode : undefined;
+      session.messageQueue.push({
+        text: queueText,
+        messageId: message.message_id,
+        mode: queueMode,
+      });
+      await replyMessage(
+        client,
+        message.message_id,
+        `当前正在执行 ${getTaskLabel(session.activeTask)} 任务，你的消息已记录（队列中 ${session.messageQueue.length} 条），完成后会自动继续。`,
       );
       return;
     }
@@ -620,7 +879,11 @@ async function handleMessage(data: {
 
   switch (command.type) {
     case "help": {
-      await replyCard(client, message.message_id, buildInfoCard("使用帮助", HELP_TEXT));
+      await replyCard(
+        client,
+        message.message_id,
+        buildInfoCard("使用帮助", HELP_TEXT),
+      );
       break;
     }
 
@@ -631,20 +894,26 @@ async function handleMessage(data: {
       const sessionLabel = activeChat
         ? `${activeChat.label} (${activeChat.chatId.slice(0, 8)})`
         : "无（执行任务时自动创建）";
-      const workDirChatCount = session.chats.filter((c) => c.workDir === session.workDir).length;
+      const workDirChatCount = session.chats.filter(
+        (c) => c.workDir === session.workDir,
+      ).length;
       let activeTaskInfo: string | undefined;
       if (session.activeTask) {
-        activeTaskInfo = `${getModeLabel(session.activeTask.mode)} · ${summarizePrompt(session.activeTask.prompt)} · 已运行 ${formatElapsed(session.activeTask.startedAt)}`;
+        activeTaskInfo = `${getTaskLabel(session.activeTask)} · ${summarizePrompt(session.activeTask.prompt)} · 已运行 ${formatElapsed(session.activeTask.startedAt)}`;
       }
-      await replyCard(client, message.message_id, buildSessionCard({
-        workspaceLabel: getWorkspaceLabel(session.workDir),
-        model: session.model,
-        sessionLabel,
-        activeTaskInfo,
-        bufferCount: session.inputBuffer.length,
-        queueCount: session.messageQueue.length,
-        chatCount: workDirChatCount,
-      }));
+      await replyCard(
+        client,
+        message.message_id,
+        buildSessionCard({
+          workspaceLabel: getWorkspaceLabel(session.workDir),
+          model: session.model,
+          sessionLabel,
+          activeTaskInfo,
+          bufferCount: session.inputBuffer.length,
+          queueCount: session.messageQueue.length,
+          chatCount: workDirChatCount,
+        }),
+      );
       break;
     }
 
@@ -652,33 +921,59 @@ async function handleMessage(data: {
       if (session.activeTask) {
         session.activeTask.abortController?.abort();
         session.messageQueue = [];
-        await replyMessage(client, message.message_id, "已取消当前任务，排队消息已清空。");
+        await replyMessage(
+          client,
+          message.message_id,
+          "已取消当前任务，排队消息已清空。",
+        );
       } else if (session.inputBuffer.length > 0) {
         const count = session.inputBuffer.length;
         clearBuffer(session);
-        await replyMessage(client, message.message_id, `已清空 ${count} 条暂存消息。`);
+        await replyMessage(
+          client,
+          message.message_id,
+          `已清空 ${count} 条暂存消息。`,
+        );
       } else {
-        await replyMessage(client, message.message_id, "当前没有正在执行的任务，也没有暂存消息。");
+        await replyMessage(
+          client,
+          message.message_id,
+          "当前没有正在执行的任务，也没有暂存消息。",
+        );
       }
       break;
     }
 
     case "chat-list": {
-      const workDirChats = session.chats.filter((c) => c.workDir === session.workDir);
+      const workDirChats = session.chats.filter(
+        (c) => c.workDir === session.workDir,
+      );
       if (workDirChats.length === 0) {
-        await replyCard(client, message.message_id, buildInfoCard(
-          "Chat 列表",
-          "当前工作区暂无 chat，发送任务时会自动创建。",
-        ));
+        await replyCard(
+          client,
+          message.message_id,
+          buildInfoCard(
+            "Chat 列表",
+            "当前工作区暂无 chat，发送任务时会自动创建。",
+          ),
+        );
         break;
       }
-      const lines: string[] = [`当前工作区共 **${workDirChats.length}** 个 chat\n`];
+      const lines: string[] = [
+        `当前工作区共 **${workDirChats.length}** 个 chat\n`,
+      ];
       workDirChats.forEach((c, i) => {
         const active = c.chatId === session.activeChatId ? " ← 当前" : "";
-        lines.push(`**${i + 1}.** ${c.label} \`(${c.chatId.slice(0, 8)})\`${active}`);
+        lines.push(
+          `**${i + 1}.** ${c.label} \`(${c.chatId.slice(0, 8)})\`${active}`,
+        );
       });
       lines.push("", "发 `/chat <编号或标签>` 切换，`/chat new` 新建。");
-      await replyCard(client, message.message_id, buildInfoCard("Chat 列表", lines.join("\n")));
+      await replyCard(
+        client,
+        message.message_id,
+        buildInfoCard("Chat 列表", lines.join("\n")),
+      );
       break;
     }
 
@@ -700,20 +995,32 @@ async function handleMessage(data: {
     }
 
     case "chat-switch": {
-      const workDirChats = session.chats.filter((c) => c.workDir === session.workDir);
+      const workDirChats = session.chats.filter(
+        (c) => c.workDir === session.workDir,
+      );
       const index = Number(command.target);
       let target: ChatRecord | undefined;
-      if (Number.isInteger(index) && index >= 1 && index <= workDirChats.length) {
+      if (
+        Number.isInteger(index) &&
+        index >= 1 &&
+        index <= workDirChats.length
+      ) {
         target = workDirChats[index - 1];
       }
       if (!target) {
         target = workDirChats.find((c) => c.label === command.target);
       }
       if (!target) {
-        const available = workDirChats.length > 0
-          ? "\n\n可用: " + workDirChats.map((c, i) => `${i + 1}. ${c.label}`).join("、")
-          : "\n\n当前工作区暂无 chat。";
-        await replyMessage(client, message.message_id, `未找到 chat '${command.target}'。${available}`);
+        const available =
+          workDirChats.length > 0
+            ? "\n\n可用: " +
+              workDirChats.map((c, i) => `${i + 1}. ${c.label}`).join("、")
+            : "\n\n当前工作区暂无 chat。";
+        await replyMessage(
+          client,
+          message.message_id,
+          `未找到 chat '${command.target}'。${available}`,
+        );
         break;
       }
       clearBuffer(session);
@@ -729,7 +1036,11 @@ async function handleMessage(data: {
     }
 
     case "ws": {
-      await replyCard(client, message.message_id, buildInfoCard("可用工作区", renderWorkspaceList(session)));
+      await replyCard(
+        client,
+        message.message_id,
+        buildInfoCard("可用工作区", renderWorkspaceList(session)),
+      );
       break;
     }
 
@@ -751,14 +1062,23 @@ async function handleMessage(data: {
       }
 
       if (!targetAlias || !targetDir) {
-        const available = workspaces.size > 0
-          ? "\n\n可用工作区: " + [...workspaces.keys()].join(", ")
-          : "\n\n尚未定义任何工作区，请在 workspaces.json 中添加。";
-        await replyMessage(client, message.message_id, `工作区 '${command.alias}' 不存在。${available}`);
+        const available =
+          workspaces.size > 0
+            ? "\n\n可用工作区: " + [...workspaces.keys()].join(", ")
+            : "\n\n尚未定义任何工作区，请在 workspaces.json 中添加。";
+        await replyMessage(
+          client,
+          message.message_id,
+          `工作区 '${command.alias}' 不存在。${available}`,
+        );
         break;
       }
       if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
-        await replyMessage(client, message.message_id, `工作区 '${targetAlias}' 指向的目录不存在或不可用：${targetDir}`);
+        await replyMessage(
+          client,
+          message.message_id,
+          `工作区 '${targetAlias}' 指向的目录不存在或不可用：${targetDir}`,
+        );
         break;
       }
       clearBuffer(session);
@@ -766,10 +1086,13 @@ async function handleMessage(data: {
       session.activeChatId = undefined;
       session.messageQueue = [];
       persistSession(session);
-      const existingChats = session.chats.filter((c) => c.workDir === targetDir).length;
-      const chatHint = existingChats > 0
-        ? `该工作区已有 ${existingChats} 个 chat，发 \`/chat\` 查看并选择。`
-        : "下一条消息会自动创建新 chat。";
+      const existingChats = session.chats.filter(
+        (c) => c.workDir === targetDir,
+      ).length;
+      const chatHint =
+        existingChats > 0
+          ? `该工作区已有 ${existingChats} 个 chat，发 \`/chat\` 查看并选择。`
+          : "下一条消息会自动创建新 chat。";
       await replyMessage(
         client,
         message.message_id,
@@ -790,16 +1113,28 @@ async function handleMessage(data: {
     }
 
     case "reload": {
-      const count = reloadWorkspaces();
-      await replyMessage(client, message.message_id, `已重新加载 ${count} 个工作区。`);
+      const wsCount = reloadWorkspaces();
+      const toolCount = reloadTools();
+      await replyMessage(
+        client,
+        message.message_id,
+        `已重新加载 ${wsCount} 个工作区，${toolCount} 个工具。`,
+      );
       break;
     }
 
     case "chats-global": {
-      const allKeys = new Set<string>([...sessions.keys(), ...persistedStates.keys()]);
+      const allKeys = new Set<string>([
+        ...sessions.keys(),
+        ...persistedStates.keys(),
+      ]);
 
       if (allKeys.size === 0) {
-        await replyCard(client, message.message_id, buildInfoCard("全局 Chat 概览", "当前无任何记录。"));
+        await replyCard(
+          client,
+          message.message_id,
+          buildInfoCard("全局 Chat 概览", "当前无任何记录。"),
+        );
         break;
       }
 
@@ -822,21 +1157,31 @@ async function handleMessage(data: {
 
         const s = sessions.get(key);
         const p = persistedStates.get(key);
-        const workDir = s?.workDir ?? p?.workDir ?? config.cursor.defaultWorkDir;
+        const workDir =
+          s?.workDir ?? p?.workDir ?? config.cursor.defaultWorkDir;
         const model = s?.model ?? p?.model ?? "Cursor 默认";
         const allChats = s?.chats ?? p?.chats ?? [];
         const activeChatId = s?.activeChatId ?? p?.activeChatId;
 
         let taskInfo = "空闲";
         if (s?.activeTask) {
-          taskInfo = `${getModeLabel(s.activeTask.mode)} · 已运行 ${formatElapsed(s.activeTask.startedAt)}`;
+          taskInfo = `${getTaskLabel(s.activeTask)} · 已运行 ${formatElapsed(s.activeTask.startedAt)}`;
         }
 
         const extra: string[] = [];
         if (s?.inputBuffer.length) extra.push(`暂存 ${s.inputBuffer.length}`);
         if (s?.messageQueue.length) extra.push(`排队 ${s.messageQueue.length}`);
 
-        const summary: SessionSummary = { key, feishuChatId: fChatId, workDir, model, allChats, activeChatId, taskInfo, extra };
+        const summary: SessionSummary = {
+          key,
+          feishuChatId: fChatId,
+          workDir,
+          model,
+          allChats,
+          activeChatId,
+          taskInfo,
+          extra,
+        };
         const list = byUser.get(uid) ?? [];
         list.push(summary);
         byUser.set(uid, list);
@@ -845,9 +1190,13 @@ async function handleMessage(data: {
       const lines: string[] = [];
       let idx = 1;
       for (const [uid, summaries] of byUser) {
-        lines.push(`**${idx}.** \`${uid.slice(0, 10)}…\` (${summaries.length} 个会话)`);
+        lines.push(
+          `**${idx}.** \`${uid.slice(0, 10)}…\` (${summaries.length} 个会话)`,
+        );
         for (const sm of summaries) {
-          const activeChat = sm.activeChatId ? sm.allChats.find((c) => c.chatId === sm.activeChatId) : undefined;
+          const activeChat = sm.activeChatId
+            ? sm.allChats.find((c) => c.chatId === sm.activeChatId)
+            : undefined;
           const chatStatus = activeChat
             ? `${activeChat.label} (${activeChat.chatId.slice(0, 8)})`
             : "无活跃 chat";
@@ -862,13 +1211,70 @@ async function handleMessage(data: {
         idx++;
       }
 
-      lines.unshift(`共 **${byUser.size}** 个用户，**${allKeys.size}** 个会话\n`);
-      await replyCard(client, message.message_id, buildInfoCard("全局 Chat 概览", lines.join("\n")));
+      lines.unshift(
+        `共 **${byUser.size}** 个用户，**${allKeys.size}** 个会话\n`,
+      );
+      await replyCard(
+        client,
+        message.message_id,
+        buildInfoCard("全局 Chat 概览", lines.join("\n")),
+      );
+      break;
+    }
+
+    case "tool-list": {
+      const tools = getToolList();
+      if (tools.length === 0) {
+        await replyCard(
+          client,
+          message.message_id,
+          buildInfoCard(
+            "可用工具",
+            "尚未定义任何工具。\n请在 `tools/` 目录下添加工具后发 `/reload`。",
+          ),
+        );
+        break;
+      }
+      const lines: string[] = [`共 **${tools.length}** 个工具\n`];
+      tools.forEach((t, i) => {
+        const desc = t.description ? ` — ${t.description}` : "";
+        lines.push(`**${i + 1}.** ${t.name}${desc}`);
+      });
+      lines.push("", "发 `/tool` <编号或名称> 即可执行。");
+      await replyCard(
+        client,
+        message.message_id,
+        buildInfoCard("可用工具", lines.join("\n")),
+      );
+      break;
+    }
+
+    case "tool-run": {
+      await executeToolCommand(
+        message.message_id,
+        message.chat_type,
+        session,
+        command.query,
+      );
       break;
     }
 
     case "input": {
-      session.inputBuffer.push({ text: command.text, messageId: message.message_id });
+      const matchedTool = matchToolByAlias(command.text);
+      if (matchedTool) {
+        await executeToolCommand(
+          message.message_id,
+          message.chat_type,
+          session,
+          matchedTool.name,
+        );
+        break;
+      }
+
+      session.inputBuffer.push({
+        text: command.text,
+        messageId: message.message_id,
+      });
 
       const count = session.inputBuffer.length;
       if (count === 1) {
@@ -878,7 +1284,11 @@ async function handleMessage(data: {
           `已记录。继续发送补充，或发 /plan 开始规划。`,
         );
       } else {
-        await replyMessage(client, message.message_id, `已记录 (共 ${count} 条)`);
+        await replyMessage(
+          client,
+          message.message_id,
+          `已记录 (共 ${count} 条)`,
+        );
       }
       break;
     }
@@ -919,7 +1329,12 @@ async function handleMessage(data: {
 
       session.activeTask = task;
       try {
-        await executeCursorCommand(message.message_id, session, command.mode, prompt);
+        await executeCursorCommand(
+          message.message_id,
+          session,
+          command.mode,
+          prompt,
+        );
       } catch (err) {
         console.error("[cursor] 执行异常:", err);
       } finally {
@@ -936,8 +1351,10 @@ const eventDispatcher = new EventDispatcher({
   loggerLevel: 2,
 }).register({
   "im.message.receive_v1": async (data) => {
-    const { message } = data;
+    const eventId = (data as any)?.event_id;
+    if (eventId && isDuplicate(eventId)) return;
 
+    const { message } = data;
     if (isDuplicate(message.message_id)) return;
 
     handleMessage(data).catch((err) => {
@@ -957,6 +1374,8 @@ async function main() {
   console.log(`默认工作目录: ${config.cursor.defaultWorkDir}`);
   console.log(`Cursor CLI: ${config.cursor.bin}`);
   console.log(`已加载 ${workspaces.size} 个工作区`);
+  const toolCount = loadTools();
+  console.log(`已加载 ${toolCount} 个工具`);
 
   await wsClient.start({ eventDispatcher });
   console.log("飞书 Cursor 桥接服务已启动，等待消息...");

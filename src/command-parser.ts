@@ -59,6 +59,15 @@ export interface ReloadCommand {
   type: "reload";
 }
 
+export interface ToolRunCommand {
+  type: "tool-run";
+  query: string;
+}
+
+export interface ToolListCommand {
+  type: "tool-list";
+}
+
 export type Command =
   | ParsedCommand
   | InputCommand
@@ -72,7 +81,9 @@ export type Command =
   | WsCommand
   | CancelCommand
   | WsSwitchCommand
-  | ReloadCommand;
+  | ReloadCommand
+  | ToolRunCommand
+  | ToolListCommand;
 
 const SLASH_COMMANDS: Record<string, CursorMode> = {
   "/plan": "plan",
@@ -145,6 +156,13 @@ export function parseCommand(text: string): Command {
     return { type: "cancel" };
   }
 
+  if (trimmed === "/tool") {
+    return { type: "tool-list" };
+  }
+  if (trimmed.startsWith("/tool ")) {
+    return { type: "tool-run", query: trimmed.slice(6).trim() };
+  }
+
   if (trimmed === "/reload") {
     return { type: "reload" };
   }
@@ -204,11 +222,16 @@ export const HELP_TEXT = `**使用方式**
 - \`/status\` → 查看当前工作区和 chat 状态
 - \`/model\` <名称> → 切换模型
 
+**工具管理**
+
+- \`/tool\` → 查看可用工具
+- \`/tool\` <编号或名称> → 执行工具
+
 **工作区管理**
 
 - \`/ws\` → 查看可用工作区
 - \`/ws\` <别名或编号> → 切换到预设工作区
-- \`/reload\` → 重新加载工作区配置
+- \`/reload\` → 重新加载工作区和工具配置
 
 **推荐流程**
 
