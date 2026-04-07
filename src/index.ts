@@ -718,27 +718,42 @@ async function executeToolCommand(
     const result = await executeTool(tool, abortController.signal);
     const dur = formatDurationMs(result.durationMs) ?? "未知";
 
+    const outputLines = result.output.trim().split("\n");
+
     if (cardMsgId) {
+      const cardLines = [`**工具**: ${tool.name}`, `**耗时**: ${dur}`];
+
+      if (result.success) {
+        const keyLines = outputLines.filter(
+          (l) => l.startsWith("[完成]") || l.startsWith("[扫描]") || l.includes("访问地址:"),
+        );
+        if (keyLines.length > 0) {
+          cardLines.push("", ...keyLines.map((l) => l.trim()));
+        }
+      } else {
+        const errorLines = outputLines.filter(
+          (l) => l.startsWith("[错误]") || l.toLowerCase().includes("error"),
+        );
+        const summary = errorLines.length > 0
+          ? errorLines.slice(-3).map((l) => l.trim()).join("\n")
+          : outputLines.slice(-3).map((l) => l.trim()).join("\n");
+        if (summary) {
+          cardLines.push("", summary);
+        }
+      }
+
       const finalCard = buildInfoCard(
         result.success ? "工具执行成功" : "工具执行失败",
-        `**工具**: ${tool.name}\n**耗时**: ${dur}`,
+        cardLines.join("\n"),
         result.success ? "green" : "red",
       );
       await editCard(client, cardMsgId, finalCard).catch(console.error);
     }
 
-    const outputText = result.output.trim();
-    if (outputText) {
-      const blocks = splitOutputToCodeBlocks(outputText);
-      for (const block of blocks) {
-        await replyMarkdownCard(client, messageId, block);
-      }
-    }
-
     if (!result.success) {
       console.error(
         `[tool] ${tool.name} 执行失败 (${dur}):`,
-        result.output.slice(0, 200),
+        result.output.slice(0, 500),
       );
     } else {
       console.log(`[tool] ${tool.name} 执行成功 (${dur})`);
