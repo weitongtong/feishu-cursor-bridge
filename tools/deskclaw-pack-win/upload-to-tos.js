@@ -45,7 +45,10 @@ async function uploadFile(localFilePath) {
   });
 
   const response = await tosClient.send(command);
+  const region = process.env.TOS_REGION || 'cn-beijing';
+  const publicUrl = `https://${BUCKET}.tos-${region}.volces.com/${objectKey}`;
   console.log(`[上传] 完成 (ETag: ${response.ETag})`);
+  console.log(`[上传] 访问地址: ${publicUrl}`);
 }
 
 async function main() {
