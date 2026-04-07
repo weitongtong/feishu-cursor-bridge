@@ -704,14 +704,17 @@ async function executeToolCommand(
 
   session.activeTask = task;
 
+  console.log(`[tool] 开始执行: ${tool.name} (${path.basename(tool.entry)})`);
+
   const initialCard = buildInfoCard(
     "工具执行中",
-    `**工具**: ${tool.name}\n**描述**: ${tool.description || "无"}\n**脚本**: ${tool.id}/${tool.entry.split("/").pop()}\n\n正在执行...`,
+    `**工具**: ${tool.name}\n**描述**: ${tool.description || "无"}\n**脚本**: ${tool.id}/${path.basename(tool.entry)}\n\n正在执行...`,
     "indigo",
   );
   const cardMsgId = await replyCard(client, messageId, initialCard);
 
   try {
+    console.log(`[tool] ${tool.name}: 已发送卡片，等待脚本执行完成...`);
     const result = await executeTool(tool, abortController.signal);
     const dur = formatDurationMs(result.durationMs) ?? "未知";
 

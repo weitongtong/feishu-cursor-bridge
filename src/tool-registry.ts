@@ -142,6 +142,7 @@ export function executeTool(
     const chunks: string[] = [];
 
     const [cmd, args] = getSpawnArgs(tool.entry);
+    console.log(`[tool] spawn: ${cmd} ${args.join(" ")}`);
     const proc = spawn(cmd, args, {
       cwd: tool.dir,
       stdio: ["ignore", "pipe", "pipe"],
