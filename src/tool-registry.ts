@@ -51,7 +51,7 @@ function scanToolsDir(): ToolDefinition[] {
       }
     }
 
-    const entryFile = meta.entry ?? "deploy.sh";
+    const entryFile = meta.entry ?? "index.sh";
     const entryPath = path.join(dir, entryFile);
     if (!fs.existsSync(entryPath)) {
       console.warn(`[tool] ${entry.name}: 入口脚本 ${entryFile} 不存在，跳过`);
@@ -121,6 +121,18 @@ export function matchToolByAlias(text: string): ToolDefinition | undefined {
   return undefined;
 }
 
+function getSpawnArgs(entry: string): [string, string[]] {
+  const ext = path.extname(entry).toLowerCase();
+  switch (ext) {
+    case ".ps1":
+      return ["powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", entry]];
+    case ".js":
+      return ["node", [entry]];
+    default:
+      return ["bash", [entry]];
+  }
+}
+
 export function executeTool(
   tool: ToolDefinition,
   signal?: AbortSignal,
@@ -129,7 +141,8 @@ export function executeTool(
     const start = Date.now();
     const chunks: string[] = [];
 
-    const proc = spawn("bash", [tool.entry], {
+    const [cmd, args] = getSpawnArgs(tool.entry);
+    const proc = spawn(cmd, args, {
       cwd: tool.dir,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env },

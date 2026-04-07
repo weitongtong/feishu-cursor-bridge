@@ -1,0 +1,6 @@
+{
+  "name": "pack-win",
+  "aliases": ["打包Windows应用", "打包win"],
+  "description": "打包 DeskClaw Windows 应用并上传到 TOS",
+  "entry": "pack-and-upload.ps1"
+}
