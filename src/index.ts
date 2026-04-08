@@ -1248,7 +1248,7 @@ async function handleMessage(data: {
           message.message_id,
           buildInfoCard(
             "可用工具",
-            "尚未定义任何工具。\n请在 `tools/` 目录下添加工具后发 `/reload`。",
+            "尚未定义任何工具。\n请在 `tools.json` 中配置工具后发 `/reload`。",
           ),
         );
         break;

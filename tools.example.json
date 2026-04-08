@@ -1,0 +1,14 @@
+{
+  "pack-win": {
+    "description": "打包 DeskClaw Windows 应用并上传到 TOS",
+    "aliases": ["打包Windows应用", "打包win"],
+    "entry": "pack-and-upload.ps1",
+    "dir": "~/home/github/deskclaw/tools/deskclaw-pack-win"
+  },
+  "deploy-dashboard": {
+    "description": "部署 token-data-dashboard 到生产服务器",
+    "aliases": ["部署token-data-dashboard项目", "部署dashboard"],
+    "entry": "deploy.sh",
+    "dir": "~/home/github/token-data-dashboard/deploy"
+  }
+}

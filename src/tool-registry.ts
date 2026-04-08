@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { expandHome } from "./config.js";
 
 export interface ToolDefinition {
   id: string;
@@ -17,50 +18,56 @@ export interface ToolResult {
   durationMs: number;
 }
 
-interface ToolJson {
+interface ToolsJsonEntry {
   name?: string;
   description?: string;
   aliases?: string[];
   entry?: string;
+  dir: string;
 }
 
-const TOOLS_DIR = path.resolve(process.cwd(), "tools");
+const TOOLS_JSON = path.resolve(process.cwd(), "tools.json");
 
 let tools: ToolDefinition[] = [];
 
-function scanToolsDir(): ToolDefinition[] {
-  if (!fs.existsSync(TOOLS_DIR) || !fs.statSync(TOOLS_DIR).isDirectory()) {
+function loadToolsFromJson(): ToolDefinition[] {
+  if (!fs.existsSync(TOOLS_JSON)) {
     return [];
   }
 
-  const entries = fs.readdirSync(TOOLS_DIR, { withFileTypes: true });
+  let obj: Record<string, ToolsJsonEntry>;
+  try {
+    const raw = fs.readFileSync(TOOLS_JSON, "utf-8");
+    obj = JSON.parse(raw) as Record<string, ToolsJsonEntry>;
+  } catch (err) {
+    console.warn(`[tool] 解析 ${TOOLS_JSON} 失败:`, err);
+    return [];
+  }
+
   const result: ToolDefinition[] = [];
 
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+  for (const [id, meta] of Object.entries(obj)) {
+    if (!meta.dir) {
+      console.warn(`[tool] ${id}: 缺少 dir 字段，跳过`);
+      continue;
+    }
 
-    const dir = path.join(TOOLS_DIR, entry.name);
-    const jsonPath = path.join(dir, "tool.json");
-
-    let meta: ToolJson = {};
-    if (fs.existsSync(jsonPath)) {
-      try {
-        meta = JSON.parse(fs.readFileSync(jsonPath, "utf-8")) as ToolJson;
-      } catch (err) {
-        console.warn(`[tool] 解析 ${jsonPath} 失败:`, err);
-      }
+    const dir = expandHome(meta.dir);
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      console.warn(`[tool] ${id}: 目录 ${dir} 不存在，跳过`);
+      continue;
     }
 
     const entryFile = meta.entry ?? "index.sh";
     const entryPath = path.join(dir, entryFile);
     if (!fs.existsSync(entryPath)) {
-      console.warn(`[tool] ${entry.name}: 入口脚本 ${entryFile} 不存在，跳过`);
+      console.warn(`[tool] ${id}: 入口脚本 ${entryFile} 不存在，跳过`);
       continue;
     }
 
     result.push({
-      id: entry.name,
-      name: meta.name ?? entry.name,
+      id,
+      name: meta.name ?? id,
       description: meta.description ?? "",
       aliases: meta.aliases ?? [],
       entry: entryPath,
@@ -73,13 +80,13 @@ function scanToolsDir(): ToolDefinition[] {
 }
 
 export function loadTools(): number {
-  tools = scanToolsDir();
-  console.log(`[tool] 已加载 ${tools.length} 个工具 (${TOOLS_DIR})`);
+  tools = loadToolsFromJson();
+  console.log(`[tool] 已加载 ${tools.length} 个工具 (${TOOLS_JSON})`);
   return tools.length;
 }
 
 export function reloadTools(): number {
-  tools = scanToolsDir();
+  tools = loadToolsFromJson();
   console.log(`[tool] 已重新加载 ${tools.length} 个工具`);
   return tools.length;
 }

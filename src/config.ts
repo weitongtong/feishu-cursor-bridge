@@ -20,7 +20,7 @@ function requireEnv(key: string): string {
   return value;
 }
 
-function expandHome(p: string): string {
+export function expandHome(p: string): string {
   if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
   if (p === "~") return os.homedir();
   return p;

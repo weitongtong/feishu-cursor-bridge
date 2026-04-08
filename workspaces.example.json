@@ -1,4 +1,8 @@
 {
-  "demo": "~/home/temp/test/demo",
-  "myapp": "~/projects/myapp"
+  "demo": "~/home/demo/demo",
+  "demo1": "~/home/demo/demo1",
+  "deskclaw": "~/home/github/deskclaw",
+  "feishu-cursor-bridge": "~/home/github/feishu-cursor-bridge",
+  "nodeskclaw": "~/home/github/nodeskclaw",
+  "NoStudio": "~/home/github/NoStudio"
 }
