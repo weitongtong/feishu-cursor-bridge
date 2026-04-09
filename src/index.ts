@@ -107,7 +107,6 @@ interface UserSession {
   model?: string;
   activeChatId?: string;
   chats: ChatRecord[];
-  nextChatLabel?: string;
   activeTask?: TaskRecord;
   messageQueue: QueuedMessage[];
   inputBuffer: QueuedMessage[];
@@ -290,6 +289,7 @@ class CardProgressUpdater {
   private prompt: string;
   private sessionLabel: string;
   private model?: string;
+  private hasChatContext: boolean;
   private startTime = Date.now();
   private currentActivity = "正在启动";
   private counts = { read: 0, write: 0, command: 0, search: 0, other: 0 };
@@ -309,6 +309,7 @@ class CardProgressUpdater {
       prompt: string;
       sessionLabel: string;
       model?: string;
+      hasChatContext: boolean;
     },
   ) {
     this.client = feishuClient;
@@ -319,6 +320,7 @@ class CardProgressUpdater {
     this.prompt = options.prompt;
     this.sessionLabel = options.sessionLabel;
     this.model = options.model;
+    this.hasChatContext = options.hasChatContext;
     this.heartbeatTimer = setInterval(() => this.scheduleFlush(), THROTTLE_MS);
   }
 
@@ -409,14 +411,10 @@ class CardProgressUpdater {
     this.currentActivity = `耗时 ${dur}`;
 
     let note: string | undefined;
-    if (
-      this.mode === "agent" &&
-      result.success &&
-      !result.isCloud &&
-      !result.cancelled
-    ) {
-      note =
-        "继续发消息可在同一 chat 中追加需求，发 `/chat new` 开启新 chat，发 `/chat` 查看所有 chat。";
+    if (result.success && !result.isCloud && !result.cancelled) {
+      note = this.hasChatContext
+        ? "继续发消息可在同一 chat 中追加需求，发 `/new` 开启新 chat，发 `/chat` 查看所有 chat。"
+        : "当前为独立执行（无上下文），如需多轮对话请先发 `/new` 创建 chat。";
     }
 
     await editCard(
@@ -444,23 +442,18 @@ function generateChatLabel(session: UserSession): string {
   return `chat-${i}`;
 }
 
-async function ensureChatId(session: UserSession): Promise<string> {
+function getActiveChatId(session: UserSession): string | undefined {
   if (session.activeChatId) {
     const found = session.chats.find((c) => c.chatId === session.activeChatId);
-    if (found) return session.activeChatId;
+    if (found) {
+      console.log(`[session] 复用已有 chat: ${found.label} (${session.activeChatId.slice(0, 8)})`);
+      return session.activeChatId;
+    }
+    console.warn(`[session] activeChatId ${session.activeChatId.slice(0, 8)} 在 chats 中未找到，当作无 chat 处理`);
+    session.activeChatId = undefined;
+    persistSession(session);
   }
-
-  const chatId = await createChat(session.workDir);
-  const label = session.nextChatLabel || generateChatLabel(session);
-  session.nextChatLabel = undefined;
-  session.chats.push({
-    chatId,
-    label,
-    workDir: session.workDir,
-    createdAt: Date.now(),
-  });
-  session.activeChatId = chatId;
-  return chatId;
+  return undefined;
 }
 
 function isResumeError(output: string): boolean {
@@ -469,8 +462,12 @@ function isResumeError(output: string): boolean {
     lower.includes("chat not found") ||
     lower.includes("invalid chat") ||
     lower.includes("no such chat") ||
-    lower.includes("resume") ||
-    lower.includes("does not exist")
+    lower.includes("failed to resume") ||
+    lower.includes("error resuming") ||
+    lower.includes("cannot resume") ||
+    lower.includes("unable to resume") ||
+    lower.includes("could not resume") ||
+    (lower.includes("does not exist") && lower.includes("chat"))
   );
 }
 
@@ -486,12 +483,9 @@ async function executeCursorCommand(
   }
   const { signal } = abortController;
 
-  let chatId: string | undefined;
-  try {
-    chatId = await ensureChatId(session);
-    persistSession(session);
-  } catch (err) {
-    console.error("[session] 创建会话失败，将以无上下文模式执行:", err);
+  const chatId = getActiveChatId(session);
+  if (!chatId) {
+    console.log(`[session] 无活跃 chat，将以独立模式执行（无 --resume）`);
   }
 
   const activeRecord = chatId
@@ -528,6 +522,7 @@ async function executeCursorCommand(
     prompt,
     sessionLabel,
     model: session.model,
+    hasChatContext: !!chatId,
   });
 
   const result = await executeCursorStream(
@@ -551,46 +546,11 @@ async function executeCursorCommand(
     chatId &&
     isResumeError(result.output)
   ) {
-    if (signal.aborted) {
-      await updater.finalize({
-        ...result,
-        cancelled: true,
-        output: "任务已取消。",
-      });
-      return { ...result, cancelled: true, output: "任务已取消。" };
-    }
-
-    console.log(`[session] chatId ${chatId} 已失效，清除后重试`);
-    session.chats = session.chats.filter((c) => c.chatId !== chatId);
+    console.warn(
+      `[session] chatId ${chatId} resume 失败，取消激活但保留记录。错误: ${result.output.slice(0, 300)}`,
+    );
     session.activeChatId = undefined;
-    updater.update({ category: "other", detail: "会话已失效，正在重建后重试" });
-
-    try {
-      const newChatId = await ensureChatId(session);
-      persistSession(session);
-      const newRecord = session.chats.find((c) => c.chatId === newChatId);
-      updater.setSessionLabel(
-        `${newRecord?.label ?? "chat"} (${newChatId.slice(0, 8)})`,
-      );
-      const retry = await executeCursorStream(
-        {
-          prompt,
-          mode,
-          workDir: session.workDir,
-          model: session.model,
-          chatId: newChatId,
-        },
-        {
-          onProgress: (event) => updater.update(event),
-          onModel: (model) => updater.setModel(model),
-        },
-        signal,
-      );
-      await updater.finalize(retry);
-      return retry;
-    } catch {
-      // fall through
-    }
+    persistSession(session);
   }
 
   await updater.finalize(result);
@@ -972,7 +932,7 @@ async function handleMessage(data: {
           message.message_id,
           buildInfoCard(
             "Chat 列表",
-            "当前工作区暂无 chat，发送任务时会自动创建。",
+            "当前工作区暂无 chat，发 `/new` 创建新 chat。",
           ),
         );
         break;
@@ -997,18 +957,31 @@ async function handleMessage(data: {
 
     case "chat-new": {
       clearBuffer(session);
-      session.activeChatId = undefined;
       session.messageQueue = [];
-      if (command.label) {
-        session.nextChatLabel = command.label;
+      try {
+        const label = command.label || generateChatLabel(session);
+        const chatId = await createChat(session.workDir);
+        session.chats.push({
+          chatId,
+          label,
+          workDir: session.workDir,
+          createdAt: Date.now(),
+        });
+        session.activeChatId = chatId;
+        persistSession(session);
+        await replyMessage(
+          client,
+          message.message_id,
+          `已创建新 chat: ${label} (${chatId.slice(0, 8)})\n工作区: ${getWorkspaceLabel(session.workDir)}`,
+        );
+      } catch (err) {
+        console.error("[chat-new] 创建 chat 失败:", err);
+        await replyMessage(
+          client,
+          message.message_id,
+          `创建 chat 失败: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
-      persistSession(session);
-      const labelHint = command.label ? `标签: ${command.label}\n` : "";
-      await replyMessage(
-        client,
-        message.message_id,
-        `已准备新 chat。\n${labelHint}工作区: ${getWorkspaceLabel(session.workDir)}\n下一条消息会开启新 chat。`,
-      );
       break;
     }
 
@@ -1101,16 +1074,18 @@ async function handleMessage(data: {
       }
       clearBuffer(session);
       session.workDir = targetDir;
-      session.activeChatId = undefined;
       session.messageQueue = [];
+
+      const wsChats = session.chats.filter((c) => c.workDir === targetDir);
+      const lastChat = wsChats.length > 0
+        ? wsChats[wsChats.length - 1]
+        : undefined;
+      session.activeChatId = lastChat?.chatId;
       persistSession(session);
-      const existingChats = session.chats.filter(
-        (c) => c.workDir === targetDir,
-      ).length;
-      const chatHint =
-        existingChats > 0
-          ? `该工作区已有 ${existingChats} 个 chat，发 \`/chat\` 查看并选择。`
-          : "下一条消息会自动创建新 chat。";
+
+      const chatHint = lastChat
+        ? `已自动切换到 chat: ${lastChat.label} (${lastChat.chatId.slice(0, 8)})`
+        : "该工作区暂无 chat，发 `/new` 创建，或直接发任务以独立模式执行。";
       await replyMessage(
         client,
         message.message_id,
