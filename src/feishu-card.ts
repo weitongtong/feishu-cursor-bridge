@@ -105,6 +105,43 @@ export function buildInfoCard(
   };
 }
 
+// ── Info Card with Actions (带按钮的 Markdown 卡片) ─────
+
+export interface CardButtonAction {
+  text: string;
+  type?: "default" | "primary" | "danger";
+  value: Record<string, unknown>;
+}
+
+export function buildInfoCardWithActions(
+  title: string,
+  markdown: string,
+  actions: CardButtonAction[],
+  template = "blue",
+): InteractiveCard {
+  const elements: unknown[] = [
+    { tag: "markdown", content: markdown },
+  ];
+
+  if (actions.length > 0) {
+    elements.push({
+      tag: "action",
+      actions: actions.map((a) => ({
+        tag: "button",
+        text: plainText(a.text, 1),
+        type: a.type ?? "primary",
+        value: a.value,
+      })),
+    });
+  }
+
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: template as never, title: plainText(title, 1) },
+    elements: elements as InteractiveCard["elements"],
+  };
+}
+
 // ── Session Card (/status) ──────────────────────────────
 
 export interface SessionCardOptions {

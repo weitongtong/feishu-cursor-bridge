@@ -53,6 +53,7 @@ if (-not $latestExe) {
 
 $sizeMB = [math]::Round($latestExe.Length / 1MB, 2)
 Write-Output "[扫描] 最新文件: $($latestExe.Name) ($sizeMB MB)"
+Write-Output "[文件路径] $($latestExe.FullName)"
 
 # ---------- 3. 上传到 TOS ----------
 Write-Output "[上传] 开始上传 ..."

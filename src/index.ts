@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { Client, EventDispatcher, WSClient } from "@larksuiteoapi/node-sdk";
 import { config, workspaces, reloadWorkspaces } from "./config.js";
 import {
@@ -19,6 +20,7 @@ import {
 import {
   buildStatusCard,
   buildInfoCard,
+  buildInfoCardWithActions,
   buildSessionCard,
   replyCard,
   replyMarkdownCard,
@@ -702,11 +704,34 @@ async function executeToolCommand(
         }
       }
 
-      const finalCard = buildInfoCard(
-        result.success ? "工具执行成功" : "工具执行失败",
-        cardLines.join("\n"),
-        result.success ? "green" : "red",
-      );
+      let finalCard;
+      const filePathLine = result.success
+        ? outputLines.find((l) => l.startsWith("[文件路径]"))
+        : undefined;
+      const filePath = filePathLine?.replace("[文件路径]", "").trim();
+
+      if (result.success && filePath && tool.name === "pack-win") {
+        finalCard = buildInfoCardWithActions(
+          "工具执行成功",
+          cardLines.join("\n"),
+          [{
+            text: "上传到正式环境",
+            type: "primary",
+            value: {
+              action: "upload_to_pg",
+              filePath,
+              toolDir: tool.dir,
+            },
+          }],
+          "green",
+        );
+      } else {
+        finalCard = buildInfoCard(
+          result.success ? "工具执行成功" : "工具执行失败",
+          cardLines.join("\n"),
+          result.success ? "green" : "red",
+        );
+      }
       await editCard(client, cardMsgId, finalCard).catch(console.error);
     }
 
@@ -1340,6 +1365,107 @@ async function handleMessage(data: {
   }
 }
 
+// ── 卡片按钮：上传到正式环境 ─────────────────────────────
+
+const uploadingCards = new Set<string>();
+
+function spawnUpload(
+  scriptPath: string,
+  filePath: string,
+  cwd: string,
+): Promise<{ success: boolean; output: string }> {
+  return new Promise((resolve) => {
+    const chunks: string[] = [];
+    const proc = spawn("node", [scriptPath, filePath], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, TOS_KEY_PREFIX: "deskclaw/pg/" },
+    });
+
+    proc.stdout.on("data", (d: Buffer) => chunks.push(d.toString()));
+    proc.stderr.on("data", (d: Buffer) => chunks.push(d.toString()));
+    proc.on("close", (code) =>
+      resolve({ success: code === 0, output: chunks.join("") }),
+    );
+    proc.on("error", (err) =>
+      resolve({ success: false, output: `执行失败: ${err.message}` }),
+    );
+  });
+}
+
+async function handleUploadToPg(
+  messageId: string,
+  value: Record<string, any>,
+): Promise<void> {
+  if (!messageId || uploadingCards.has(messageId)) return;
+  uploadingCards.add(messageId);
+
+  try {
+    const { filePath, toolDir } = value as {
+      filePath?: string;
+      toolDir?: string;
+    };
+    if (!filePath || !toolDir) {
+      console.error("[card-action] 缺少 filePath 或 toolDir");
+      return;
+    }
+
+    const scriptPath = path.join(toolDir, "upload-to-tos.js");
+
+    await editCard(
+      client,
+      messageId,
+      buildInfoCard(
+        "正在上传到正式环境",
+        `**文件**: ${path.basename(filePath)}\n\n正在上传到 \`deskclaw/pg/\` ...`,
+        "indigo",
+      ),
+    ).catch(console.error);
+
+    const result = await spawnUpload(scriptPath, filePath, toolDir);
+    const outputLines = result.output.trim().split("\n");
+
+    if (result.success) {
+      const urlLine = outputLines.find((l) => l.includes("访问地址:"));
+      const url = urlLine?.split("访问地址:")[1]?.trim() ?? "";
+      const cardLines = [
+        `**文件**: ${path.basename(filePath)}`,
+        `**路径**: \`deskclaw/pg/\``,
+      ];
+      if (url) cardLines.push(`**访问地址**: ${url}`);
+
+      await editCard(
+        client,
+        messageId,
+        buildInfoCard("上传到正式环境成功", cardLines.join("\n"), "green"),
+      ).catch(console.error);
+      console.log(`[card-action] 上传到正式环境成功: ${path.basename(filePath)}`);
+    } else {
+      const errLines = outputLines.filter(
+        (l) => l.startsWith("[错误]") || l.toLowerCase().includes("error"),
+      );
+      const errMsg = errLines.length > 0
+        ? errLines.slice(-3).join("\n")
+        : outputLines.slice(-3).join("\n");
+
+      await editCard(
+        client,
+        messageId,
+        buildInfoCard(
+          "上传到正式环境失败",
+          `**文件**: ${path.basename(filePath)}\n\n${errMsg}`,
+          "red",
+        ),
+      ).catch(console.error);
+      console.error(`[card-action] 上传到正式环境失败: ${result.output.slice(0, 500)}`);
+    }
+  } finally {
+    uploadingCards.delete(messageId);
+  }
+}
+
+// ── 事件分发 ─────────────────────────────────────────────
+
 const eventDispatcher = new EventDispatcher({
   loggerLevel: 2,
 }).register({
@@ -1354,7 +1480,19 @@ const eventDispatcher = new EventDispatcher({
       replyError(client, message.message_id, err).catch(console.error);
     });
   },
-});
+}).register({
+  "card.action.trigger": async (data: any) => {
+    const action = data?.action;
+    const messageId = data?.open_message_id;
+
+    if (action?.value?.action === "upload_to_pg" && messageId) {
+      handleUploadToPg(messageId, action.value).catch(console.error);
+      return { toast: { type: "info", content: "正在上传到正式环境..." } };
+    }
+
+    return undefined;
+  },
+} as any);
 
 const wsClient = new WSClient({
   appId: config.feishu.appId,
