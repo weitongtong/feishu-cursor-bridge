@@ -1412,16 +1412,6 @@ async function handleUploadToPg(
 
     const scriptPath = path.join(toolDir, "upload-to-tos.js");
 
-    await editCard(
-      client,
-      messageId,
-      buildInfoCard(
-        "正在上传到正式环境",
-        `**文件**: ${path.basename(filePath)}\n\n正在上传到 \`deskclaw/pg/\` ...`,
-        "indigo",
-      ),
-    ).catch(console.error);
-
     const result = await spawnUpload(scriptPath, filePath, toolDir);
     const outputLines = result.output.trim().split("\n");
 
@@ -1483,11 +1473,22 @@ const eventDispatcher = new EventDispatcher({
 }).register({
   "card.action.trigger": async (data: any) => {
     const action = data?.action;
-    const messageId = data?.open_message_id;
+    const messageId = data?.context?.open_message_id;
 
     if (action?.value?.action === "upload_to_pg" && messageId) {
+      const filePath = action.value.filePath as string | undefined;
       handleUploadToPg(messageId, action.value).catch(console.error);
-      return { toast: { type: "info", content: "正在上传到正式环境..." } };
+      return {
+        toast: { type: "info", content: "正在上传到正式环境..." },
+        card: {
+          type: "raw",
+          data: buildInfoCard(
+            "正在上传到正式环境",
+            `**文件**: ${filePath ? path.basename(filePath) : "未知"}\n\n正在上传到 \`deskclaw/pg/\` ...`,
+            "indigo",
+          ),
+        },
+      };
     }
 
     return undefined;
