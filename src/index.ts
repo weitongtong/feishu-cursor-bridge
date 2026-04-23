@@ -715,12 +715,10 @@ async function executeToolCommand(
           "工具执行成功",
           cardLines.join("\n"),
           [{
-            text: "上传到正式环境",
+            text: "上传到OTA",
             type: "primary",
             value: {
-              action: "upload_to_pg",
-              filePath,
-              toolDir: tool.dir,
+              action: "upload_to_ota",
             },
           }],
           "green",
@@ -1365,22 +1363,18 @@ async function handleMessage(data: {
   }
 }
 
-// ── 卡片按钮：上传到正式环境 ─────────────────────────────
+// ── 卡片按钮：上传到OTA ──────────────────────────────────
 
 const uploadingCards = new Set<string>();
 
-function spawnUpload(
-  scriptPath: string,
-  filePath: string,
-  cwd: string,
-): Promise<{ success: boolean; output: string }> {
+function spawnUpload(): Promise<{ success: boolean; output: string }> {
   return new Promise((resolve) => {
     const chunks: string[] = [];
-    const proc = spawn("node", [scriptPath, filePath], {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, TOS_KEY_PREFIX: "deskclaw/pg/" },
-    });
+    const proc = spawn(
+      "powershell",
+      ["-ExecutionPolicy", "Bypass", "-File", "D:\\work\\github\\aa\\win-ota.ps1"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
 
     proc.stdout.on("data", (d: Buffer) => chunks.push(d.toString()));
     proc.stderr.on("data", (d: Buffer) => chunks.push(d.toString()));
@@ -1393,43 +1387,23 @@ function spawnUpload(
   });
 }
 
-async function handleUploadToPg(
+async function handleUploadToOta(
   messageId: string,
-  value: Record<string, any>,
 ): Promise<void> {
   if (!messageId || uploadingCards.has(messageId)) return;
   uploadingCards.add(messageId);
 
   try {
-    const { filePath, toolDir } = value as {
-      filePath?: string;
-      toolDir?: string;
-    };
-    if (!filePath || !toolDir) {
-      console.error("[card-action] 缺少 filePath 或 toolDir");
-      return;
-    }
-
-    const scriptPath = path.join(toolDir, "upload-to-tos.js");
-
-    const result = await spawnUpload(scriptPath, filePath, toolDir);
+    const result = await spawnUpload();
     const outputLines = result.output.trim().split("\n");
 
     if (result.success) {
-      const urlLine = outputLines.find((l) => l.includes("访问地址:"));
-      const url = urlLine?.split("访问地址:")[1]?.trim() ?? "";
-      const cardLines = [
-        `**文件**: ${path.basename(filePath)}`,
-        `**路径**: \`deskclaw/pg/\``,
-      ];
-      if (url) cardLines.push(`**访问地址**: ${url}`);
-
       await editCard(
         client,
         messageId,
-        buildInfoCard("上传到正式环境成功", cardLines.join("\n"), "green"),
+        buildInfoCard("上传到OTA成功", outputLines.slice(-5).join("\n"), "green"),
       ).catch(console.error);
-      console.log(`[card-action] 上传到正式环境成功: ${path.basename(filePath)}`);
+      console.log("[card-action] 上传到OTA成功");
     } else {
       const errLines = outputLines.filter(
         (l) => l.startsWith("[错误]") || l.toLowerCase().includes("error"),
@@ -1441,13 +1415,9 @@ async function handleUploadToPg(
       await editCard(
         client,
         messageId,
-        buildInfoCard(
-          "上传到正式环境失败",
-          `**文件**: ${path.basename(filePath)}\n\n${errMsg}`,
-          "red",
-        ),
+        buildInfoCard("上传到OTA失败", errMsg, "red"),
       ).catch(console.error);
-      console.error(`[card-action] 上传到正式环境失败: ${result.output.slice(0, 500)}`);
+      console.error(`[card-action] 上传到OTA失败: ${result.output.slice(0, 500)}`);
     }
   } finally {
     uploadingCards.delete(messageId);
@@ -1475,16 +1445,15 @@ const eventDispatcher = new EventDispatcher({
     const action = data?.action;
     const messageId = data?.context?.open_message_id;
 
-    if (action?.value?.action === "upload_to_pg" && messageId) {
-      const filePath = action.value.filePath as string | undefined;
-      handleUploadToPg(messageId, action.value).catch(console.error);
+    if (action?.value?.action === "upload_to_ota" && messageId) {
+      handleUploadToOta(messageId).catch(console.error);
       return {
-        toast: { type: "info", content: "正在上传到正式环境..." },
+        toast: { type: "info", content: "正在上传到OTA..." },
         card: {
           type: "raw",
           data: buildInfoCard(
-            "正在上传到正式环境",
-            `**文件**: ${filePath ? path.basename(filePath) : "未知"}\n\n正在上传到 \`deskclaw/pg/\` ...`,
+            "正在上传到OTA",
+            "正在执行 OTA 上传 ...",
             "indigo",
           ),
         },
